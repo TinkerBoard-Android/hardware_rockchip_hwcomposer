@@ -54,7 +54,7 @@
 
 #include "hwc_util.h"
 #include "hwc_rockchip.h"
-
+#include <android/configuration.h>
 #define UM_PER_INCH 25400
 
 namespace android {
@@ -67,9 +67,9 @@ static int update_display_bestmode(hwc_drm_display_t *hd, int display, DrmConnec
 #if SKIP_BOOT
 static unsigned int g_boot_cnt = 0;
 #endif
-#if RK_INVALID_REFRESH
+//#if RK_INVALID_REFRESH
 hwc_context_t* g_ctx = NULL;
-#endif
+//#endif
 
 class DummySwSyncTimeline {
  public:
@@ -193,6 +193,14 @@ class DrmHotplugHandler : public DrmEventHandler {
     }
 
     if (!primary) {
+      for (auto &conn : drm_->connectors()) {
+        if (!(conn->possible_displays() & HWC_DISPLAY_PRIMARY_BIT))
+          continue;
+        primary = conn.get();
+      }
+    }
+
+    if (!primary) {
       ALOGE("%s %d Failed to find primary display\n", __FUNCTION__, __LINE__);
       return;
     }
@@ -287,8 +295,9 @@ struct hwc_context_t {
   int fb_fd;
   int fb_blanked;
   int hdmi_status_fd;
-#if RK_INVALID_REFRESH
+
     bool                isGLESComp;
+#if RK_INVALID_REFRESH
     bool                mOneWinOpt;
     threadPamaters      mRefresh;
 #endif
@@ -619,7 +628,23 @@ int DrmHwcLayer::InitFromHwcLayer(struct hwc_context_t *ctx, int display, hwc_la
   UN_USED(importer);
 
   bClone_ = bClone;
-  stereo = sf_layer->alreadyStereo;
+
+    int32_t alreadyStereo = 0;
+#ifdef USE_HWC2
+    if(sf_layer->handle)
+    {
+        alreadyStereo = hwc_get_handle_alreadyStereo(ctx->gralloc, sf_layer->handle);
+        if(alreadyStereo < 0)
+        {
+            ALOGE("hwc_get_handle_alreadyStereo fail");
+            alreadyStereo = 0;
+        }
+    }
+#else
+    alreadyStereo = sf_layer->alreadyStereo;
+#endif
+  stereo = alreadyStereo;
+
   if(sf_layer->compositionType == HWC_FRAMEBUFFER_TARGET)
    bFbTarget_ = true;
   else
@@ -694,21 +719,51 @@ int DrmHwcLayer::InitFromHwcLayer(struct hwc_context_t *ctx, int display, hwc_la
         v_scale_mul = (float) (source_crop.bottom - source_crop.top)
 	                    / (display_frame.bottom - display_frame.top);
     }
+    if(sf_handle)
+    {
 #if RK_DRM_GRALLOC
-    width = hwc_get_handle_attibute(ctx->gralloc,sf_layer->handle,ATT_WIDTH);
-    height = hwc_get_handle_attibute(ctx->gralloc,sf_layer->handle,ATT_HEIGHT);
-    stride = hwc_get_handle_attibute(ctx->gralloc,sf_layer->handle,ATT_STRIDE);
-    format = hwc_get_handle_attibute(ctx->gralloc,sf_layer->handle,ATT_FORMAT);
+        width = hwc_get_handle_attibute(gralloc,sf_layer->handle,ATT_WIDTH);
+        height = hwc_get_handle_attibute(gralloc,sf_layer->handle,ATT_HEIGHT);
+        stride = hwc_get_handle_attibute(gralloc,sf_layer->handle,ATT_STRIDE);
+        format = hwc_get_handle_attibute(gralloc,sf_layer->handle,ATT_FORMAT);
 #else
-    width = hwc_get_handle_width(ctx->gralloc,sf_layer->handle);
-    height = hwc_get_handle_height(ctx->gralloc,sf_layer->handle);
-    stride = hwc_get_handle_stride(ctx->gralloc,sf_layer->handle);
-    format = hwc_get_handle_format(ctx->gralloc,sf_layer->handle);
+        width = hwc_get_handle_width(gralloc,sf_layer->handle);
+        height = hwc_get_handle_height(gralloc,sf_layer->handle);
+        stride = hwc_get_handle_stride(gralloc,sf_layer->handle);
+        format = hwc_get_handle_format(gralloc,sf_layer->handle);
 #endif
+    }
+    else
+    {
+        format = HAL_PIXEL_FORMAT_RGBA_8888;
+    }
     if(format == HAL_PIXEL_FORMAT_YCrCb_NV12 || format == HAL_PIXEL_FORMAT_YCrCb_NV12_10)
         is_yuv = true;
     else
         is_yuv = false;
+
+    if(is_yuv)
+    {
+        uint32_t android_colorspace = hwc_get_layer_colorspace(sf_layer);
+        colorspace = colorspace_convert_to_linux(android_colorspace);
+        if(colorspace == 0)
+        {
+            colorspace = V4L2_COLORSPACE_DEFAULT;
+        }
+
+        if((android_colorspace & HAL_DATASPACE_TRANSFER_ST2084) == HAL_DATASPACE_TRANSFER_ST2084)
+            eotf = SMPTE_ST2084;
+        else
+        {
+            //ALOGE("Unknow etof %d",eotf);
+            eotf = TRADITIONAL_GAMMA_SDR;
+        }
+    }
+    else
+    {
+        colorspace = V4L2_COLORSPACE_DEFAULT;
+        eotf = TRADITIONAL_GAMMA_SDR;
+    }
 
 #if RK_VIDEO_SKIP_LINE
     if(format == HAL_PIXEL_FORMAT_YCrCb_NV12 || format == HAL_PIXEL_FORMAT_YCrCb_NV12_10)
@@ -737,10 +792,20 @@ int DrmHwcLayer::InitFromHwcLayer(struct hwc_context_t *ctx, int display, hwc_la
     bpp = android::bytesPerPixel(format);
     size = (source_crop.right - source_crop.left) * (source_crop.bottom - source_crop.top) * bpp;
     is_large = (mode.h_display()*mode.v_display()*4*3/4 > size)? true:false;
-    name = sf_layer->LayerName;
+
+    char layername[100];
+#ifdef USE_HWC2
+    if(sf_handle)
+    {
+            hwc_get_handle_layername(gralloc, sf_handle, layername, 100);
+    }
+#else
+    strcpy(layername, sf_layer->LayerName);
+#endif
+    name = layername;
     mlayer = sf_layer;
 
-    ALOGV("\t layerName=%s,sourceCropf(%f,%f,%f,%f)",sf_layer->LayerName,
+    ALOGV("\t layerName=%s,sourceCropf(%f,%f,%f,%f)",layername,
     source_crop.left,source_crop.top,source_crop.right,source_crop.bottom);
     ALOGV("h_scale_mul=%f,v_scale_mul=%f,is_scale=%d,is_large=%d",h_scale_mul,v_scale_mul,is_scale,is_large);
 
@@ -796,43 +861,57 @@ int DrmHwcLayer::InitFromHwcLayer(struct hwc_context_t *ctx, int display, hwc_la
     return ret;
 #endif
 
-  ret = handle.CopyBufferHandle(sf_layer->handle, gralloc);
-  if (ret)
-    return ret;
-
-#if 0
-  gralloc_buffer_usage= drm_handle->usage;
-#else
-  ret = gralloc->perform(gralloc, GRALLOC_MODULE_PERFORM_GET_USAGE,
-                         handle.get(), &gralloc_buffer_usage);
-  if (ret) {
-    ALOGE("Failed to get usage for buffer %p (%d)", handle.get(), ret);
-    return ret;
-  }
-#endif
 
 #if USE_AFBC_LAYER
-    ret = gralloc->perform(gralloc, GRALLOC_MODULE_PERFORM_GET_INTERNAL_FORMAT,
-                         handle.get(), &internal_format);
-    if (ret) {
-        ALOGE("Failed to get internal_format for buffer %p (%d)", handle.get(), ret);
-        return ret;
+    if(sf_handle)
+    {
+        ret = gralloc->perform(gralloc, GRALLOC_MODULE_PERFORM_GET_INTERNAL_FORMAT,
+                             sf_handle, &internal_format);
+        if (ret) {
+            ALOGE("Failed to get internal_format for buffer %p (%d)", sf_handle, ret);
+            return ret;
+        }
+
+        if(isAfbcInternalFormat(internal_format))
+            is_afbc = true;
     }
 
-    if(isAfbcInternalFormat(internal_format))
-        is_afbc = true;
+    if(bFbTarget_ && !sf_handle)
+    {
+        static int iFbdcSupport = -1;
+
+        if(iFbdcSupport == -1)
+        {
+            char fbdc_value[PROPERTY_VALUE_MAX];
+            property_get("sys.gmali.fbdc_target", fbdc_value, "0");
+            iFbdcSupport = atoi(fbdc_value);
+            if(iFbdcSupport > 0)
+                is_afbc = true;
+        }
+    }
 #endif
 
   return 0;
 }
 
-int DrmHwcLayer::ImportBuffer(hwc_layer_1_t *sf_layer, Importer *importer)
+int DrmHwcLayer::ImportBuffer(struct hwc_context_t *ctx, hwc_layer_1_t *sf_layer, Importer *importer)
 {
-  int ret = buffer.ImportBuffer(sf_layer->handle, importer
+   int ret = buffer.ImportBuffer(sf_layer->handle, importer
 #if RK_VIDEO_SKIP_LINE
   , bSkipLine
 #endif
   );
+
+  ret = handle.CopyBufferHandle(sf_layer->handle, ctx->gralloc);
+  if (ret)
+    return ret;
+
+  ret = ctx->gralloc->perform(ctx->gralloc, GRALLOC_MODULE_PERFORM_GET_USAGE,
+                         handle.get(), &gralloc_buffer_usage);
+  if (ret) {
+    ALOGE("Failed to get usage for buffer %p (%d)", handle.get(), ret);
+    return ret;
+  }
 
   return ret;
 }
@@ -853,10 +932,21 @@ static bool hwc_skip_layer(const std::pair<int, int> &indices, int i) {
   return indices.first >= 0 && i >= indices.first && i <= indices.second;
 }
 
-static bool is_use_gles_comp(struct hwc_context_t *ctx, hwc_display_contents_1_t *display_content, int display_id)
+static bool is_use_gles_comp(struct hwc_context_t *ctx, DrmConnector *connector, hwc_display_contents_1_t *display_content, int display_id)
 {
     int num_layers = display_content->numHwLayers;
     hwc_drm_display_t *hd = &ctx->displays[display_id];
+    DrmCrtc *crtc = NULL;
+    if (!connector) {
+      ALOGE("Failed to get connector for display %d line=%d", display_id, __LINE__);
+    }
+    else
+    {
+        crtc = ctx->drm.GetCrtcFromConnector(connector);
+        if (connector->state() != DRM_MODE_CONNECTED || !crtc) {
+          ALOGE("Failed to get crtc for display %d line=%d", display_id, __LINE__);
+        }
+    }
 
     //force go into GPU
     /*
@@ -908,6 +998,18 @@ static bool is_use_gles_comp(struct hwc_context_t *ctx, hwc_display_contents_1_t
 
     for (int j = 0; j < num_layers-1; j++) {
         hwc_layer_1_t *layer = &display_content->hwLayers[j];
+        int src_l,src_t,src_w,src_h;
+        src_l = (int)layer->sourceCropf.left;
+        src_t = (int)layer->sourceCropf.top;
+        src_w = (int)(layer->sourceCropf.right - layer->sourceCropf.left);
+        src_h = (int)(layer->sourceCropf.bottom - layer->sourceCropf.top);
+
+        if(src_w <= 0 || src_h <= 0)
+        {
+            ALOGD_IF(log_level(DBG_DEBUG),"layer src sourceCropf(%f,%f,%f,%f) is invalid,go to GPU GLES at line=%d",
+                    layer->sourceCropf.left,layer->sourceCropf.top,layer->sourceCropf.right,layer->sourceCropf.bottom, __LINE__);
+            return true;
+        }
 
         if (layer->flags & HWC_SKIP_LAYER)
         {
@@ -944,7 +1046,14 @@ static bool is_use_gles_comp(struct hwc_context_t *ctx, hwc_display_contents_1_t
 #endif
         if(layer->handle)
         {
-            DumpLayer(layer->LayerName,layer->handle);
+            char layername[100];
+
+#ifdef USE_HWC2
+            hwc_get_handle_layername(ctx->gralloc, layer->handle, layername, 100);
+#else
+            strcpy(layername, layer->LayerName);
+#endif
+            DumpLayer(layername,layer->handle);
 
 #if RK_DRM_GRALLOC
             format = hwc_get_handle_attibute(ctx->gralloc,layer->handle,ATT_FORMAT);
@@ -959,11 +1068,15 @@ static bool is_use_gles_comp(struct hwc_context_t *ctx, hwc_display_contents_1_t
 
             if(hd->isHdr)
             {
-                ALOGD_IF(log_level(DBG_DEBUG), "layer is hdr video,go to GPU GLES at line=%d", __LINE__);
-                return true;
+                if(connector && !ctx->drm.is_hdmi_support_hdr(connector)
+                    && crtc && !ctx->drm.is_plane_support_hdr2sdr(crtc))
+                {
+                    ALOGD_IF(log_level(DBG_DEBUG), "layer is hdr video,go to GPU GLES at line=%d", __LINE__);
+                    return true;
+                }
             }
 #if 1
-            if(!strstr(layer->LayerName,"Sprite"))
+            if(!strstr(layername,"Sprite"))
             {
                 int src_xoffset = layer->sourceCropf.left * getPixelWidthByAndroidFormat(format);
                 if(!IS_ALIGN(src_xoffset,16))
@@ -1037,6 +1150,252 @@ static HDMI_STAT detect_hdmi_status(void)
         return HDMI_ON;
 }
 
+static bool parse_hdmi_output_format_prop(char* strprop, drm_hdmi_output_type *format, dw_hdmi_rockchip_color_depth *depth) {
+    char color_depth[PROPERTY_VALUE_MAX];
+    char color_format[PROPERTY_VALUE_MAX];
+    if (!strcmp(strprop, "Auto")) {
+        *format = DRM_HDMI_OUTPUT_YCBCR_HQ;
+        *depth = ROCKCHIP_DEPTH_DEFAULT;
+        return true;
+    }
+
+    if (!strcmp(strprop, "RGB-8bit")) {
+        *format = DRM_HDMI_OUTPUT_DEFAULT_RGB;
+        *depth = ROCKCHIP_HDMI_DEPTH_8;
+        return true;
+    }
+
+    if (!strcmp(strprop, "RGB-10bit")) {
+        *format = DRM_HDMI_OUTPUT_DEFAULT_RGB;
+        *depth = ROCKCHIP_HDMI_DEPTH_10;
+        return true;
+    }
+
+    if (!strcmp(strprop, "YCBCR444-8bit")) {
+        *format = DRM_HDMI_OUTPUT_YCBCR444;
+        *depth = ROCKCHIP_HDMI_DEPTH_8;
+        return true;
+    }
+
+    if (!strcmp(strprop, "YCBCR444-10bit")) {
+        *format = DRM_HDMI_OUTPUT_YCBCR444;
+        *depth = ROCKCHIP_HDMI_DEPTH_10;
+        return true;
+    }
+
+    if (!strcmp(strprop, "YCBCR422-8bit")) {
+        *format = DRM_HDMI_OUTPUT_YCBCR422;
+        *depth = ROCKCHIP_HDMI_DEPTH_8;
+        return true;
+    }
+
+    if (!strcmp(strprop, "YCBCR422-10bit")) {
+        *format = DRM_HDMI_OUTPUT_YCBCR422;
+        *depth = ROCKCHIP_HDMI_DEPTH_10;
+        return true;
+    }
+
+    if (!strcmp(strprop, "YCBCR420-8bit")) {
+        *format = DRM_HDMI_OUTPUT_YCBCR420;
+        *depth = ROCKCHIP_HDMI_DEPTH_8;
+        return true;
+    }
+
+    if (!strcmp(strprop, "YCBCR420-10bit")) {
+        *format = DRM_HDMI_OUTPUT_YCBCR420;
+        *depth = ROCKCHIP_HDMI_DEPTH_10;
+        return true;
+    }
+    ALOGE("hdmi output format is invalid. [%s]", strprop);
+    return false;
+}
+
+static bool update_hdmi_output_format(struct hwc_context_t *ctx, DrmConnector *connector, int display,
+                         hwc_drm_display_t *hd) {
+
+    int timeline = 0;
+    drm_hdmi_output_type    color_format = DRM_HDMI_OUTPUT_DEFAULT_RGB;
+    dw_hdmi_rockchip_color_depth color_depth = ROCKCHIP_HDMI_DEPTH_8;
+    int ret = 0;
+    int need_change_format = 0;
+    int need_change_depth = 0;
+    char prop_format[PROPERTY_VALUE_MAX];
+    timeline = property_get_int32("sys.display.timeline", -1);
+    drmModeAtomicReqPtr pset = NULL;
+    /*
+    * force update propetry when timeline is zero or not exist.
+    */
+    if (timeline && timeline == hd->display_timeline &&
+    hd->hotplug_timeline == hd->ctx->drm.timeline())
+        return 0;
+    //hd->display_timeline = timeline;//let update_display_bestmode function update the value.
+    //hd->hotplug_timeline = hd->ctx->drm.timeline();//let update_display_bestmode function update the value.
+    memset(prop_format, 0, sizeof(prop_format));
+    if (display == HWC_DISPLAY_PRIMARY)
+    {
+    /* if resolution is null,set to "Auto" */
+        property_get("persist.sys.color.main", prop_format, "Auto");
+    }
+    else
+    {
+        property_get("persist.sys.color.aux", prop_format, "Auto");
+    }
+    ret = parse_hdmi_output_format_prop(prop_format, &color_format, &color_depth);
+    if (ret == false) {
+        return false;
+    }
+
+    if(hd->color_format != color_format) {
+        need_change_format = 1;
+    }
+
+    if(hd->color_depth != color_depth) {
+        need_change_depth = 1;
+    }
+    if(connector->hdmi_output_format_property().id() > 0 && need_change_format > 0) {
+
+        pset = drmModeAtomicAlloc();
+        if (!pset) {
+            ALOGE("%s:line=%d Failed to allocate property set", __FUNCTION__, __LINE__);
+            return false;
+        }
+        ALOGD_IF(log_level(DBG_VERBOSE),"%s: change hdmi output format: %d", __FUNCTION__, color_format);
+        ret = drmModeAtomicAddProperty(pset, connector->id(), connector->hdmi_output_format_property().id(), color_format);
+        if (ret < 0) {
+            ALOGE("%s:line=%d Failed to add prop[%d] to [%d]", __FUNCTION__, __LINE__, connector->hdmi_output_format_property().id(), connector->id());
+        }
+
+        if (ret < 0) {
+            ALOGE("%s:line=%d Failed to commit pset ret=%d\n", __FUNCTION__, __LINE__, ret);
+            drmModeAtomicFree(pset);
+            return false;
+        }
+        else
+        {
+            hd->color_format = color_format;
+        }
+    }
+
+    if(connector->hdmi_output_depth_property().id() > 0 && need_change_depth > 0) {
+
+        if (!pset) {
+            pset = drmModeAtomicAlloc();
+        }
+        if (!pset) {
+            ALOGE("%s:line=%d Failed to allocate property set", __FUNCTION__, __LINE__);
+            return false;
+        }
+
+        ALOGD_IF(log_level(DBG_VERBOSE),"%s: change hdmi output depth: %d", __FUNCTION__, color_depth);
+        ret = drmModeAtomicAddProperty(pset, connector->id(), connector->hdmi_output_depth_property().id(), color_depth);
+        if (ret < 0) {
+            ALOGE("%s:line=%d Failed to add prop[%d] to [%d]", __FUNCTION__, __LINE__, connector->hdmi_output_depth_property().id(), connector->id());
+        }
+
+        if (ret < 0) {
+            ALOGE("%s:line=%d Failed to commit pset ret=%d\n", __FUNCTION__, __LINE__, ret);
+            drmModeAtomicFree(pset);
+            return false;
+        }
+        else
+        {
+            hd->color_depth = color_depth;
+        }
+    }
+    if (pset != NULL) {
+        drmModeAtomicCommit(ctx->drm.fd(), pset, DRM_MODE_ATOMIC_ALLOW_MODESET, &ctx->drm);
+        drmModeAtomicFree(pset);
+        pset = NULL;
+    }
+    return true;
+}
+
+/**
+ * @brief set hdr_metadata and colorimetry.
+ *
+ * @param hdr_metadata  [IN] hdr metadata
+ * @param android_colorspace [IN] colorspace
+ * @return
+ *          true: set successfully.
+ *          false: set fail.
+ */
+static bool set_hdmi_hdr_meta(struct hwc_context_t *ctx, DrmConnector *connector,
+                                struct hdr_static_metadata* hdr_metadata, hwc_drm_display_t *hd,
+                                uint32_t android_colorspace)
+{
+    uint32_t blob_id = 0;
+    int ret = -1;
+    int colorimetry = 0;
+    if(!ctx || !connector || !hdr_metadata)
+    {
+        ALOGE("%s:line=%d parameter is null", __FUNCTION__, __LINE__);
+        return false;
+    }
+
+    if(connector->hdr_metadata_property().id())
+    {
+        ALOGD_IF(log_level(DBG_VERBOSE),"%s: android_colorspace = 0x%x", __FUNCTION__, android_colorspace);
+        drmModeAtomicReqPtr pset = drmModeAtomicAlloc();
+        if (!pset) {
+            ALOGE("%s:line=%d Failed to allocate property set", __FUNCTION__, __LINE__);
+            return false;
+        }
+        if(!memcmp(&hd->last_hdr_metadata, hdr_metadata, sizeof(struct hdr_static_metadata)))
+        {
+            ALOGD_IF(log_level(DBG_VERBOSE),"%s: no need to update metadata", __FUNCTION__);
+        }
+        else
+        {
+            ALOGD_IF(log_level(DBG_VERBOSE),"%s: hdr_metadata eotf=0x%x, hd->last_hdr_metadata=0x%x", __FUNCTION__,
+                                            hdr_metadata->eotf, hd->last_hdr_metadata.eotf);
+            ctx->drm.CreatePropertyBlob(hdr_metadata, sizeof(struct hdr_static_metadata), &blob_id);
+            ret = drmModeAtomicAddProperty(pset, connector->id(), connector->hdr_metadata_property().id(), blob_id);
+            if (ret < 0) {
+              ALOGE("%s:line=%d Failed to add prop[%d] to [%d]", __FUNCTION__, __LINE__, connector->hdr_metadata_property().id(), connector->id());
+            }
+        }
+
+        if(connector->hdmi_output_colorimetry_property().id())
+        {
+            if((android_colorspace & HAL_DATASPACE_STANDARD_BT2020) == HAL_DATASPACE_STANDARD_BT2020)
+            {
+                colorimetry = COLOR_METRY_ITU_2020;
+            }
+
+            if(hd->colorimetry != colorimetry)
+            {
+                ALOGD_IF(log_level(DBG_VERBOSE),"%s: change bt2020 %d", __FUNCTION__, colorimetry);
+                ret = drmModeAtomicAddProperty(pset, connector->id(), connector->hdmi_output_colorimetry_property().id(), colorimetry);
+                if (ret < 0) {
+                  ALOGE("%s:line=%d Failed to add prop[%d] to [%d]", __FUNCTION__, __LINE__, connector->hdmi_output_colorimetry_property().id(), connector->id());
+                }
+            }
+        }
+
+        drmModeAtomicCommit(ctx->drm.fd(), pset, DRM_MODE_ATOMIC_ALLOW_MODESET, &ctx->drm);
+        if (ret < 0) {
+            ALOGE("%s:line=%d Failed to commit pset ret=%d\n", __FUNCTION__, __LINE__, ret);
+            drmModeAtomicFree(pset);
+            return false;
+        }
+        else
+        {
+            memcpy(&hd->last_hdr_metadata, hdr_metadata, sizeof(struct hdr_static_metadata));
+            hd->colorimetry = colorimetry;
+        }
+        if (blob_id)
+            ctx->drm.DestroyPropertyBlob(blob_id);
+
+        drmModeAtomicFree(pset);
+        return true;
+    }
+    else
+    {
+        ALOGD_IF(log_level(DBG_VERBOSE),"%s: hdmi don't support hdr metadata", __FUNCTION__);
+        return false;
+    }
+}
+
 static int hwc_prepare(hwc_composer_device_1_t *dev, size_t num_displays,
                        hwc_display_contents_1_t **display_contents) {
   struct hwc_context_t *ctx = (struct hwc_context_t *)&dev->common;
@@ -1099,7 +1458,7 @@ static int hwc_prepare(hwc_composer_device_1_t *dev, size_t num_displays,
       hwc_list_nodraw(display_contents[i]);
       continue;
     }
-
+	update_hdmi_output_format(ctx, connector, i, hd);
     update_display_bestmode(hd, i, connector);
     DrmMode mode = connector->best_mode();
     connector->set_current_mode(mode);
@@ -1167,12 +1526,14 @@ static int hwc_prepare(hwc_composer_device_1_t *dev, size_t num_displays,
 #else
             format = hwc_get_handle_format(ctx->gralloc,layer->handle);
 #endif
+
            if(format == HAL_PIXEL_FORMAT_YCrCb_NV12)
            {
                 hd->isVideo = true;
            }
-           if(format == HAL_PIXEL_FORMAT_YCrCb_NV12_10)
-           {
+
+            if(format == HAL_PIXEL_FORMAT_YCrCb_NV12_10)
+            {
                 hd->is10bitVideo = true;
                 hd->isVideo = true;
                 ret = ctx->gralloc->perform(ctx->gralloc, GRALLOC_MODULE_PERFORM_GET_USAGE,
@@ -1184,11 +1545,72 @@ static int hwc_prepare(hwc_composer_device_1_t *dev, size_t num_displays,
                 if(usage & HDRUSAGE)
                 {
                     isHdr = true;
+                    if(hd->isHdr != isHdr && ctx->drm.is_hdmi_support_hdr(connector))
+                    {
+                        uint32_t android_colorspace = hwc_get_layer_colorspace(layer);
+                        struct hdr_static_metadata hdr_metadata;
+
+                        memset(&hdr_metadata, 0, sizeof(hdr_metadata));
+                        if((android_colorspace & HAL_DATASPACE_TRANSFER_ST2084) == HAL_DATASPACE_TRANSFER_ST2084)
+                        {
+                            hdr_metadata.eotf = SMPTE_ST2084;
+                        }
+                        else
+                        {
+                            //ALOGE("Unknow etof %d",eotf);
+                            hdr_metadata.eotf = TRADITIONAL_GAMMA_SDR;
+                        }
+
+                        set_hdmi_hdr_meta(ctx, connector, &hdr_metadata, hd, android_colorspace);
+                    }
                     break;
                 }
-                //break;
-           }
+            }
         }
+    }
+
+    bool force_not_invalid_refresh = false;
+    for (int j = 0; j < num_layers-1; j++) {
+        hwc_layer_1_t *layer = &display_contents[i]->hwLayers[j];
+
+        if(layer->handle)
+        {
+#if RK_DRM_GRALLOC
+            format = hwc_get_handle_attibute(ctx->gralloc,layer->handle, ATT_FORMAT);
+#else
+            format = hwc_get_handle_format(ctx->gralloc,layer->handle);
+#endif
+
+            char layername[100];
+
+#ifdef USE_HWC2
+            hwc_get_handle_layername(ctx->gralloc, layer->handle, layername, 100);
+#else
+            strcpy(layername, layer->LayerName);
+#endif
+            int src_l,src_t,src_w,src_h;
+
+            src_l = (int)layer->sourceCropf.left;
+            src_t = (int)layer->sourceCropf.top;
+            src_w = (int)(layer->sourceCropf.right - layer->sourceCropf.left);
+            src_h = (int)(layer->sourceCropf.bottom - layer->sourceCropf.top);
+            if(!force_not_invalid_refresh && src_w > src_h && src_w >= 3840
+              && format != HAL_PIXEL_FORMAT_YCrCb_NV12 && format != HAL_PIXEL_FORMAT_YCrCb_NV12_10)
+            {
+                force_not_invalid_refresh = true;
+            }
+            if(strstr(layername,"SurfaceView") && strstr(layername,"gallery"))
+            {
+                 ALOGD_IF(log_level(DBG_DEBUG),"%s:line=%d w=%d,h=%d,force_not_invalid_refresh=%d,format=0x%x",
+                        __FUNCTION__,__LINE__,src_w,src_h,force_not_invalid_refresh,format);
+            }
+         }
+    }
+
+    if(ctx->mOneWinOpt && force_not_invalid_refresh && hd->rel_xres >= 3840 && hd->rel_xres != hd->framebuffer_width)
+    {
+       ALOGD_IF(log_level(DBG_DEBUG),"disable static timer");
+       ctx->mOneWinOpt = false;
     }
 
     //Switch hdr mode
@@ -1209,6 +1631,16 @@ static int hwc_prepare(hwc_composer_device_1_t *dev, size_t num_displays,
             ctl_little_cpu(1);
         }
 #endif
+
+        if(!hd->isHdr && ctx->drm.is_hdmi_support_hdr(connector))
+        {
+            uint32_t android_colorspace = 0;
+            struct hdr_static_metadata hdr_metadata;
+
+            ALOGD_IF(log_level(DBG_VERBOSE),"disable hdmi hdr meta");
+            memset(&hdr_metadata, 0, sizeof(hdr_metadata));
+            set_hdmi_hdr_meta(ctx, connector, &hdr_metadata, hd, android_colorspace);
+        }
     }
 
 #if 1
@@ -1221,7 +1653,21 @@ static int hwc_prepare(hwc_composer_device_1_t *dev, size_t num_displays,
     {
         for(int j=num_layers-1; j>=0; j--) {
             hwc_layer_1_t *layer = &display_contents[i]->hwLayers[j];
-            if(layer->alreadyStereo == FPS_3D) {
+            int32_t alreadyStereo = 0;
+#ifdef USE_HWC2
+            if(layer->handle)
+            {
+                alreadyStereo = hwc_get_handle_alreadyStereo(ctx->gralloc, layer->handle);
+                if(alreadyStereo < 0)
+                {
+                    ALOGE("hwc_get_handle_alreadyStereo fail");
+                    alreadyStereo = 0;
+                }
+            }
+#else
+            alreadyStereo = layer->alreadyStereo;
+#endif
+            if(alreadyStereo == FPS_3D) {
                 iLastFps = j;
                 break;
             }
@@ -1234,7 +1680,7 @@ static int hwc_prepare(hwc_composer_device_1_t *dev, size_t num_displays,
     }
 
     if(!use_framebuffer_target)
-        use_framebuffer_target = is_use_gles_comp(ctx, display_contents[i], connector->display());
+        use_framebuffer_target = is_use_gles_comp(ctx, connector, display_contents[i], connector->display());
 
 #if RK_VIDEO_UI_OPT
     video_ui_optimize(ctx->gralloc, display_contents[i], &ctx->displays[connector->display()]);
@@ -1244,14 +1690,33 @@ static int hwc_prepare(hwc_composer_device_1_t *dev, size_t num_displays,
     int index = 0;
     for (int j = 0; j < num_layers; j++) {
       hwc_layer_1_t *sf_layer = &display_contents[i]->hwLayers[j];
-      if(sf_layer->handle == NULL)
+      if(sf_layer->compositionType != HWC_FRAMEBUFFER_TARGET && sf_layer->handle == NULL)
         continue;
       if(sf_layer->compositionType == HWC_NODRAW)
         continue;
 
         if(hd->stereo_mode == FPS_3D && iLastFps < num_layers-1)
         {
-            if(j>iLastFps  && sf_layer->alreadyStereo != FPS_3D && sf_layer->displayStereo)
+            int32_t alreadyStereo = 0, displayStereo = 0;
+#ifdef USE_HWC2
+            alreadyStereo = hwc_get_handle_alreadyStereo(ctx->gralloc, sf_layer->handle);
+            if(alreadyStereo < 0)
+            {
+                ALOGE("hwc_get_handle_alreadyStereo fail");
+                alreadyStereo = 0;
+            }
+
+            displayStereo = hwc_get_handle_displayStereo(ctx->gralloc, sf_layer->handle);
+            if(displayStereo < 0)
+            {
+                ALOGE("hwc_get_handle_alreadyStereo fail");
+                displayStereo = 0;
+            }
+#else
+            alreadyStereo = sf_layer->alreadyStereo;
+            displayStereo = sf_layer->displayStereo;
+#endif
+            if(j>iLastFps  && alreadyStereo!= FPS_3D && displayStereo)
             {
                 bHasFPS_3D_UI = true;
             }
@@ -1402,13 +1867,26 @@ static int hwc_prepare(hwc_composer_device_1_t *dev, size_t num_displays,
 
     for (int j = 0; j < num_layers; ++j) {
         hwc_layer_1_t *layer = &display_contents[i]->hwLayers[j];
+        char layername[100];
 
-        if(layer->compositionType==HWC_FRAMEBUFFER)
-            ALOGD_IF(log_level(DBG_DEBUG),"%s: HWC_FRAMEBUFFER",layer->LayerName);
-        else if(layer->compositionType==HWC_OVERLAY)
-            ALOGD_IF(log_level(DBG_DEBUG),"%s: HWC_OVERLAY",layer->LayerName);
+#ifdef USE_HWC2
+        if(layer->handle == NULL)
+        {
+            strcpy(layername,"");
+        }
         else
-            ALOGD_IF(log_level(DBG_DEBUG),"%s: HWC_OTHER",layer->LayerName);
+        {
+            hwc_get_handle_layername(ctx->gralloc, layer->handle, layername, 100);
+        }
+#else
+        strcpy(layername, layer->LayerName);
+#endif
+        if(layer->compositionType==HWC_FRAMEBUFFER)
+            ALOGD_IF(log_level(DBG_DEBUG),"%s: HWC_FRAMEBUFFER",layername);
+        else if(layer->compositionType==HWC_OVERLAY)
+            ALOGD_IF(log_level(DBG_DEBUG),"%s: HWC_OVERLAY",layername);
+        else
+            ALOGD_IF(log_level(DBG_DEBUG),"%s: HWC_OTHER",layername);
     }
   }
 
@@ -1628,8 +2106,28 @@ static int hwc_set(hwc_composer_device_1_t *dev, size_t num_displays,
         (dc->flags & HWC_GEOMETRY_CHANGED) == HWC_GEOMETRY_CHANGED;
     for (size_t j=0; j< display_contents.layers.size(); j++) {
       DrmHwcLayer &layer = display_contents.layers[j];
+      if(!layer.sf_handle && layer.raw_sf_layer->handle)
+      {
+        layer.sf_handle = layer.raw_sf_layer->handle;
+#if RK_DRM_GRALLOC
+        layer.width = hwc_get_handle_attibute(ctx->gralloc,layer.sf_handle,ATT_WIDTH);
+        layer.height = hwc_get_handle_attibute(ctx->gralloc,layer.sf_handle,ATT_HEIGHT);
+        layer.stride = hwc_get_handle_attibute(ctx->gralloc,layer.sf_handle,ATT_STRIDE);
+        layer.format = hwc_get_handle_attibute(ctx->gralloc,layer.sf_handle,ATT_FORMAT);
+#else
+        layer.width = hwc_get_handle_width(ctx->gralloc,layer.sf_handle);
+        layer.height = hwc_get_handle_height(ctx->gralloc,layer.sf_handle);
+        layer.stride = hwc_get_handle_stride(ctx->gralloc,layer.sf_handle);
+        layer.format = hwc_get_handle_format(ctx->gralloc,layer.sf_handle);
+#endif
+      }
+      if(!layer.sf_handle)
+      {
+        ALOGE("sf_handle is null,maybe fb target is null");
+        return -EINVAL;
+      }
       if(!layer.bClone_)
-        layer.ImportBuffer(layer.raw_sf_layer, ctx->importer.get());
+        layer.ImportBuffer(ctx, layer.raw_sf_layer, ctx->importer.get());
       map.layers.emplace_back(std::move(layer));
     }
   }
@@ -1891,6 +2389,19 @@ static int hwc_get_display_configs(struct hwc_composer_device_1 *dev,
   return 0;
 }
 
+static float getDefaultDensity(uint32_t width, uint32_t height) {
+    // Default density is based on TVs: 1080p displays get XHIGH density,
+    // lower-resolution displays get TV density. Maybe eventually we'll need
+    // to update it for 4K displays, though hopefully those just report
+    // accurate DPI information to begin with. This is also used for virtual
+    // displays and even primary displays with older hwcomposers, so be
+    // careful about orientation.
+
+    uint32_t h = width < height ? width : height;
+    if (h >= 1080) return ACONFIGURATION_DENSITY_XHIGH;
+    else           return ACONFIGURATION_DENSITY_TV;
+}
+
 static int hwc_get_display_attributes(struct hwc_composer_device_1 *dev,
                                       int display, uint32_t config,
                                       const uint32_t *attributes,
@@ -1924,12 +2435,12 @@ static int hwc_get_display_attributes(struct hwc_composer_device_1 *dev,
         break;
       case HWC_DISPLAY_DPI_X:
         /* Dots per 1000 inches */
-        values[i] = mm_width ? (w * UM_PER_INCH) / mm_width : 0;
+        values[i] = mm_width ? (w * UM_PER_INCH) / mm_width : getDefaultDensity(w,h)*1000;
         break;
       case HWC_DISPLAY_DPI_Y:
         /* Dots per 1000 inches */
         values[i] =
-            mm_height ? (h * UM_PER_INCH) / mm_height : 0;
+            mm_height ? (h * UM_PER_INCH) / mm_height : getDefaultDensity(w,h)*1000;
         break;
     }
   }
@@ -2024,6 +2535,7 @@ static int hwc_set_initial_config(struct hwc_context_t *ctx, int display) {
 static int hwc_initialize_display(struct hwc_context_t *ctx, int display) {
     hwc_drm_display_t *hd = &ctx->displays[display];
     hd->ctx = ctx;
+    hd->gralloc = ctx->gralloc;
 #if RK_VIDEO_UI_OPT
     hd->iUiFd = -1;
     hd->bHideUi = false;
@@ -2038,6 +2550,8 @@ static int hwc_initialize_display(struct hwc_context_t *ctx, int display) {
     hd->active = true;
     hd->last_hdmi_status = HDMI_ON;
     hd->isHdr = false;
+    memset(&hd->last_hdr_metadata, 0, sizeof(hd->last_hdr_metadata));
+    hd->colorimetry = 0;
 
   return 0;
 }

@@ -71,6 +71,27 @@ int DrmConnector::Init() {
   if (ret)
     ALOGW("Could not get hue property\n");
 
+  ret = drm_->GetConnectorProperty(*this, "HDR_SOURCE_METADATA", &hdr_metadata_property_);
+  if (ret)
+    ALOGW("Could not get hdr metadata property\n");
+
+  ret = drm_->GetConnectorProperty(*this, "HDR_PANEL_METADATA", &hdr_panel_property_);
+  if (ret)
+    ALOGW("Could not get hdr metadata property\n");
+
+  ret = drm_->GetConnectorProperty(*this, "hdmi_output_colorimetry", &hdmi_output_colorimetry_);
+  if (ret)
+    ALOGW("Could not get hdmi_output_colorimetry property\n");
+
+  ret = drm_->GetConnectorProperty(*this, "hdmi_output_format", &hdmi_output_format_);
+  if (ret) {
+    ALOGW("Could not get hdmi_output_format property\n");
+  }
+
+  ret = drm_->GetConnectorProperty(*this, "hdmi_output_depth", &hdmi_output_depth_);
+  if (ret) {
+   ALOGW("Could not get hdmi_output_depth property\n");
+  }
   return 0;
 }
 
@@ -196,6 +217,26 @@ const DrmProperty &DrmConnector::saturation_id_property() const {
 }
 const DrmProperty &DrmConnector::hue_id_property() const {
   return hue_id_property_;
+}
+
+const DrmProperty &DrmConnector::hdr_metadata_property() const {
+  return hdr_metadata_property_;
+}
+
+const DrmProperty &DrmConnector::hdr_panel_property() const {
+  return hdr_panel_property_;
+}
+
+const DrmProperty &DrmConnector::hdmi_output_colorimetry_property() const {
+  return hdmi_output_colorimetry_;
+}
+
+const DrmProperty &DrmConnector::hdmi_output_format_property() const {
+  return hdmi_output_format_;
+}
+
+const DrmProperty &DrmConnector::hdmi_output_depth_property() const {
+  return hdmi_output_depth_;
 }
 
 DrmEncoder *DrmConnector::encoder() const {

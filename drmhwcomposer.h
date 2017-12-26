@@ -28,7 +28,7 @@
 #include "hwc_debug.h"
 
 /*hwc version*/
-#define GHWC_VERSION                    "0.32"
+#define GHWC_VERSION                    "0.34"
 
 /* hdr usage */
 #define HDRUSAGE                                       0x3000000
@@ -229,11 +229,13 @@ struct DrmHwcLayer {
   int bpp;
   int group_id;
   int share_id;
+  uint32_t colorspace;
+  uint16_t eotf;
   std::string name;
   size_t index;
   hwc_layer_1_t *mlayer;
 
-  int ImportBuffer(hwc_layer_1_t *sf_layer, Importer *importer);
+  int ImportBuffer(struct hwc_context_t *ctx, hwc_layer_1_t *sf_layer, Importer *importer);
   int InitFromHwcLayer(struct hwc_context_t *ctx, int display, hwc_layer_1_t *sf_layer, Importer *importer,
                         const gralloc_module_t *gralloc, bool bClone);
 

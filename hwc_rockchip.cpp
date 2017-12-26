@@ -1,6 +1,9 @@
 #define LOG_TAG "hwc_rk"
 
 #include <inttypes.h>
+#ifdef TARGET_BOARD_PLATFORM_RK3368
+#include <hardware/img_gralloc_public.h>
+#endif
 #include "hwc_rockchip.h"
 #include "hwc_util.h"
 
@@ -75,6 +78,7 @@ bool isAfbcInternalFormat(uint64_t internal_format)
 }
 #endif
 
+#if RK_INVALID_REFRESH
 int init_thread_pamaters(threadPamaters* mThreadPamaters)
 {
     if(mThreadPamaters) {
@@ -100,7 +104,6 @@ int free_thread_pamaters(threadPamaters* mThreadPamaters)
     return 0;
 }
 
-#if RK_INVALID_REFRESH
 void TimeInt2Obj(int imSecond, timeval *ptVal)
 {
     ptVal->tv_sec=imSecond/1000;
@@ -125,7 +128,84 @@ int hwc_static_screen_opt_set(bool isGLESComp)
 }
 #endif
 
-#if 1
+#ifdef USE_HWC2
+int detect_3d_mode(hwc_drm_display_t *hd, hwc_display_contents_1_t *display_content, int display)
+{
+    bool is_3d = false;
+    int force3d = 0;
+    unsigned int numlayer = display_content->numHwLayers;
+    int needStereo = 0;
+
+    for (unsigned int j = 0; j <(numlayer - 1); j++) {
+        if(display_content->hwLayers[j].handle)
+        {
+            needStereo = hwc_get_handle_alreadyStereo(hd->gralloc, display_content->hwLayers[j].handle);
+            if(needStereo > 0)
+            {
+                break;
+            }
+        }
+    }
+
+    if(!needStereo)
+    {
+        force3d = hwc_get_int_property("sys.hwc.force3d.primary","0");
+
+        if(1==force3d || 2==force3d){
+            if(display == 0 || display == 1)
+                needStereo = force3d;
+        }
+    }
+
+    if(needStereo)
+    {
+        is_3d = true;
+        if(needStereo == 1)
+            hd->stereo_mode = H_3D;
+        else if (needStereo == 2)
+            hd->stereo_mode = V_3D;
+        else if (needStereo == 8)
+            hd->stereo_mode = FPS_3D;
+        else
+            ALOGD_IF(log_level(DBG_VERBOSE),"It is unknow 3d mode needStereo=%d",needStereo);
+    }
+
+    for (unsigned int j = 0; j <(numlayer - 1); j++) {
+        if(display_content->hwLayers[j].handle)
+        {
+            int ret = hwc_set_handle_displayStereo(hd->gralloc, display_content->hwLayers[j].handle, needStereo);
+            if(ret < 0)
+            {
+                ALOGE("%s:hwc_set_handle_displayStereo fail", __FUNCTION__);
+                break;
+            }
+        }
+    }
+
+    if (needStereo & 0x8000) {
+        for (unsigned int j = 0; j <(numlayer - 1); j++) {
+            if(display_content->hwLayers[j].handle)
+            {
+                int ret = hwc_set_handle_displayStereo(hd->gralloc, display_content->hwLayers[j].handle, needStereo & (~0x8000));
+                if(ret < 0)
+                {
+                    ALOGE("%s:hwc_set_handle_displayStereo fail", __FUNCTION__);
+                    break;
+                }
+
+                ret = hwc_set_handle_alreadyStereo(hd->gralloc, display_content->hwLayers[j].handle, 0);
+                if(ret < 0)
+                {
+                    ALOGE("%s:hwc_set_handle_alreadyStereo fail", __FUNCTION__);
+                    break;
+                }
+            }
+        }
+    }
+    return is_3d;
+}
+
+#else
 int detect_3d_mode(hwc_drm_display_t *hd, hwc_display_contents_1_t *display_content, int display)
 {
     bool is_3d = false;
@@ -279,6 +359,190 @@ int hwc_control_3dmode(int fd_3d, int value, int flag)
     return ret;
 }
 
+#endif
+
+#ifdef USE_HWC2
+int hwc_get_handle_displayStereo(const gralloc_module_t *gralloc, buffer_handle_t hnd)
+{
+    int ret = 0;
+    int op = GRALLOC_MODULE_PERFORM_GET_RK_ASHMEM;
+    struct rk_ashmem_t rk_ashmem;
+
+    if(gralloc && gralloc->perform)
+        ret = gralloc->perform(gralloc, op, hnd, &rk_ashmem);
+    else
+        ret = -EINVAL;
+
+    if(ret != 0)
+    {
+        ALOGE("%s:cann't get value from gralloc", __FUNCTION__);
+    }
+
+    return rk_ashmem.displayStereo;
+}
+
+int hwc_set_handle_displayStereo(const gralloc_module_t *gralloc, buffer_handle_t hnd, int32_t displayStereo)
+{
+    int ret = 0;
+    int op = GRALLOC_MODULE_PERFORM_GET_RK_ASHMEM;
+    struct rk_ashmem_t rk_ashmem;
+
+    if(gralloc && gralloc->perform)
+        ret = gralloc->perform(gralloc, op, hnd, &rk_ashmem);
+    else
+        ret = -EINVAL;
+
+    if(ret != 0)
+    {
+        ALOGE("%s:cann't get value from gralloc", __FUNCTION__);
+        goto exit;
+    }
+
+    if(displayStereo != rk_ashmem.displayStereo)
+    {
+        op = GRALLOC_MODULE_PERFORM_SET_RK_ASHMEM;
+        rk_ashmem.displayStereo = displayStereo;
+
+        if(gralloc && gralloc->perform)
+            ret = gralloc->perform(gralloc, op, hnd, &rk_ashmem);
+        else
+            ret = -EINVAL;
+
+        if(ret != 0)
+        {
+            ALOGE("%s:cann't get value from gralloc", __FUNCTION__);
+        }
+    }
+
+exit:
+    return ret;
+}
+
+int hwc_get_handle_alreadyStereo(const gralloc_module_t *gralloc, buffer_handle_t hnd)
+{
+    int ret = 0;
+    int op = GRALLOC_MODULE_PERFORM_GET_RK_ASHMEM;
+    struct rk_ashmem_t rk_ashmem;
+
+    if(gralloc && gralloc->perform)
+        ret = gralloc->perform(gralloc, op, hnd, &rk_ashmem);
+    else
+        ret = -EINVAL;
+
+    if(ret != 0)
+    {
+        ALOGE("%s:cann't get value from gralloc", __FUNCTION__);
+    }
+
+    return rk_ashmem.alreadyStereo;
+}
+
+int hwc_set_handle_alreadyStereo(const gralloc_module_t *gralloc, buffer_handle_t hnd, int32_t alreadyStereo)
+{
+    int ret = 0;
+    int op = GRALLOC_MODULE_PERFORM_GET_RK_ASHMEM;
+    struct rk_ashmem_t rk_ashmem;
+
+    if(gralloc && gralloc->perform)
+        ret = gralloc->perform(gralloc, op, hnd, &rk_ashmem);
+    else
+        ret = -EINVAL;
+
+    if(ret != 0)
+    {
+        ALOGE("%s:cann't get value from gralloc", __FUNCTION__);
+        goto exit;
+    }
+
+    if(alreadyStereo != rk_ashmem.alreadyStereo )
+    {
+        op = GRALLOC_MODULE_PERFORM_SET_RK_ASHMEM;
+        rk_ashmem.alreadyStereo = alreadyStereo;
+
+        if(gralloc && gralloc->perform)
+            ret = gralloc->perform(gralloc, op, hnd, &rk_ashmem);
+        else
+            ret = -EINVAL;
+
+        if(ret != 0)
+        {
+            ALOGE("%s:cann't get value from gralloc", __FUNCTION__);
+        }
+    }
+
+exit:
+    return ret;
+}
+
+int hwc_get_handle_layername(const gralloc_module_t *gralloc, buffer_handle_t hnd, char* layername, unsigned long len)
+{
+    int ret = 0;
+    int op = GRALLOC_MODULE_PERFORM_GET_RK_ASHMEM;
+    struct rk_ashmem_t rk_ashmem;
+    unsigned long str_size;
+
+    if(!layername)
+        return -EINVAL;
+
+    if(gralloc && gralloc->perform)
+        ret = gralloc->perform(gralloc, op, hnd, &rk_ashmem);
+    else
+        ret = -EINVAL;
+
+    if(ret != 0)
+    {
+        ALOGE("%s:cann't get value from gralloc", __FUNCTION__);
+        goto exit;
+    }
+
+    str_size = strlen(rk_ashmem.LayerName)+1;
+    str_size = str_size > len ? len:str_size;
+    memcpy(layername,rk_ashmem.LayerName,str_size);
+
+exit:
+    return ret;
+}
+
+int hwc_set_handle_layername(const gralloc_module_t *gralloc, buffer_handle_t hnd, const char* layername)
+{
+    int ret = 0;
+    int op = GRALLOC_MODULE_PERFORM_GET_RK_ASHMEM;
+    struct rk_ashmem_t rk_ashmem;
+    unsigned long str_size;
+
+    if(!layername)
+        return -EINVAL;
+
+    if(gralloc && gralloc->perform)
+        ret = gralloc->perform(gralloc, op, hnd, &rk_ashmem);
+    else
+        ret = -EINVAL;
+
+    if(ret != 0)
+    {
+        ALOGE("%s:cann't get value from gralloc", __FUNCTION__);
+        goto exit;
+    }
+
+    op = GRALLOC_MODULE_PERFORM_SET_RK_ASHMEM;
+
+    str_size = strlen(layername)+1;
+    str_size = str_size > sizeof(rk_ashmem.LayerName) ? sizeof(rk_ashmem.LayerName):str_size;
+    memcpy(rk_ashmem.LayerName,layername,str_size);
+
+    if(gralloc && gralloc->perform)
+        ret = gralloc->perform(gralloc, op, hnd, &rk_ashmem);
+    else
+        ret = -EINVAL;
+
+    if(ret != 0)
+    {
+        ALOGE("%s:cann't get value from gralloc", __FUNCTION__);
+    }
+
+exit:
+    return ret;
+}
 #endif
 
 int hwc_get_handle_width(const gralloc_module_t *gralloc, buffer_handle_t hnd)
@@ -521,6 +785,56 @@ uint32_t hwc_get_handle_phy_addr(const gralloc_module_t *gralloc, buffer_handle_
     return phy_addr;
 }
 #endif
+
+uint32_t hwc_get_layer_colorspace(hwc_layer_1_t *layer)
+{
+    uint32_t colorspace = (layer->reserved[0]) | (layer->reserved[1] << 8) |
+                            (layer->reserved[2] <<  16) | (layer->reserved[3] << 24);
+
+     ALOGD_IF(log_level(DBG_VERBOSE),"%s: reserved[0]=0x%x,reserved[1]=0x%x,reserved[2]=0x%x,reserved[3]=0x%x",__FUNCTION__,
+            layer->reserved[0],layer->reserved[1],
+            layer->reserved[2],layer->reserved[3]);
+
+    return colorspace;
+}
+
+/*
+    颜色空间	            Linux标准定义	        Android标准定义
+    SRGB full range	    V4L2_COLORSPACE_SRGB	    HAL_DATASPACE_TRANSFER_SRGB
+    Bt601 full range	V4L2_COLORSPACE_JPEG	    HAL_DATASPACE_V0_JFIF
+    Bt601 limit range	V4L2_COLORSPACE_SMPTE170M	HAL_DATASPACE_BT601_525/HAL_DATASPACE_V0_BT601_625
+    Bt709 limit range	V4L2_COLORSPACE_REC709	    HAL_DATASPACE_V0_BT709
+    Bt2020 limit range	V4L2_COLORSPACE_BT2020	    HAL_DATASPACE_STANDARD_BT2020
+*/
+#define CONTAIN_VALUE(value) ((colorspace & value) == value)
+uint32_t colorspace_convert_to_linux(uint32_t colorspace)
+{
+    if(CONTAIN_VALUE(HAL_DATASPACE_TRANSFER_SRGB))
+    {
+        return V4L2_COLORSPACE_SRGB;
+    }
+    else if(CONTAIN_VALUE(HAL_DATASPACE_V0_JFIF))
+    {
+        return V4L2_COLORSPACE_JPEG;
+    }
+    else if(CONTAIN_VALUE(HAL_DATASPACE_BT601_525) || CONTAIN_VALUE(HAL_DATASPACE_V0_BT601_625))
+    {
+        return V4L2_COLORSPACE_SMPTE170M;
+    }
+    else if(CONTAIN_VALUE(HAL_DATASPACE_V0_BT709))
+    {
+        return V4L2_COLORSPACE_REC709;
+    }
+    else if(CONTAIN_VALUE(HAL_DATASPACE_STANDARD_BT2020))
+    {
+        return V4L2_COLORSPACE_BT2020;
+    }
+    else
+    {
+        //ALOGE("Unknow colorspace 0x%x",colorspace);
+        return 0;
+    }
+}
 
 bool vop_support_format(uint32_t hal_format) {
   switch (hal_format) {
@@ -882,6 +1196,24 @@ static std::vector<DrmPlane *> rkGetNoAlphaUsablePlanes(DrmCrtc *crtc) {
   return usable_planes;
 }
 
+static std::vector<DrmPlane *> rkGetNoEotfUsablePlanes(DrmCrtc *crtc) {
+    DrmResources* drm = crtc->getDrmReoources();
+    std::vector<PlaneGroup *>& plane_groups = drm->GetPlaneGroups();
+    std::vector<DrmPlane *> usable_planes;
+    //loop plane groups.
+    for (std::vector<PlaneGroup *> ::const_iterator iter = plane_groups.begin();
+       iter != plane_groups.end(); ++iter) {
+            if(!(*iter)->bUse)
+                //only count the first plane in plane group.
+                std::copy_if((*iter)->planes.begin(), (*iter)->planes.begin()+1,
+                       std::back_inserter(usable_planes),
+                       [=](DrmPlane *plane) {
+                       return !plane->is_use() && plane->GetCrtcSupported(*crtc) && !plane->get_hdr2sdr(); }
+                       );
+  }
+  return usable_planes;
+}
+
 //According to zpos and combine layer count,find the suitable plane.
 static bool MatchPlane(std::vector<DrmHwcLayer*>& layer_vector,
                                uint64_t* zpos,
@@ -894,11 +1226,12 @@ static bool MatchPlane(std::vector<DrmHwcLayer*>& layer_vector,
 {
     uint32_t combine_layer_count = 0;
     uint32_t layer_size = layer_vector.size();
-    bool b_yuv=false,b_scale=false,b_alpha=false;
+    bool b_yuv=false,b_scale=false,b_alpha=false,b_hdr2sdr=true;
     std::vector<PlaneGroup *> ::const_iterator iter;
     std::vector<PlaneGroup *>& plane_groups = drm->GetPlaneGroups();
     uint64_t rotation = 0;
     uint64_t alpha = 0xFF;
+    uint16_t eotf = TRADITIONAL_GAMMA_SDR;
 
 #ifndef TARGET_BOARD_PLATFORM_RK3288
     UN_USED(fbSize);
@@ -998,6 +1331,22 @@ static bool MatchPlane(std::vector<DrmHwcLayer*>& layer_vector,
                                 else
                                     bNeed = true;
                             }
+
+                            eotf = (*iter_layer)->eotf;
+                            b_hdr2sdr = (*iter_plane)->get_hdr2sdr();
+                            if(eotf != TRADITIONAL_GAMMA_SDR)
+                            {
+                                if(!b_hdr2sdr)
+                                {
+                                    ALOGV("layer name=%s,plane id=%d",(*iter_layer)->name.c_str(),(*iter_plane)->id());
+                                    ALOGD_IF(log_level(DBG_DEBUG),"Plane(%d) cann't support etof,layer eotf=%d,hdr2sdr=%d",
+                                            (*iter_plane)->id(),(*iter_layer)->eotf,(*iter_plane)->get_hdr2sdr());
+                                    continue;
+                                }
+                                else
+                                    bNeed = true;
+                            }
+
 #ifdef TARGET_BOARD_PLATFORM_RK3288
                             int src_w,src_h;
 
@@ -1056,11 +1405,21 @@ static bool MatchPlane(std::vector<DrmHwcLayer*>& layer_vector,
                                         continue;
                                     }
                                 }
+
+                                if(eotf == TRADITIONAL_GAMMA_SDR && b_hdr2sdr)
+                                {
+                                    std::vector<DrmPlane *> no_eotf_planes = rkGetNoEotfUsablePlanes(crtc);
+                                    if(no_eotf_planes.size() > 0)
+                                    {
+                                        ALOGD_IF(log_level(DBG_DEBUG),"Plane(%d) don't need use eotf feature",(*iter_plane)->id());
+                                        continue;
+                                    }
+                                }
                             }
 #if RK_RGA
                             if(!drm->isSupportRkRga()
 #if USE_AFBC_LAYER
-                               || isAfbcInternalFormat((*iter_layer)->internal_format)
+                               || (*iter_layer)->is_afbc
 #endif
                                )
 #endif
@@ -1740,14 +2099,22 @@ void video_ui_optimize(const gralloc_module_t *gralloc, hwc_display_contents_1_t
                         int iHeight = hwc_get_handle_height(gralloc,second_layer->handle);
 #endif
                         unsigned int *cpu_addr;
-                        gralloc->lock(gralloc, second_layer->handle, GRALLOC_USAGE_SW_READ_MASK | GRALLOC_USAGE_SW_WRITE_MASK,
+
+#if 0
+                        IMG_native_handle_t * pvHandle = (IMG_native_handle_t *)second_layer->handle;
+                        cpu_addr= (unsigned int *)pvHandle->pvBase;
+#else
+                        gralloc->lock(gralloc, second_layer->handle, GRALLOC_USAGE_SW_READ_MASK,
                                 0, 0, iWidth, iHeight, (void **)&cpu_addr);
+#endif
                         ret = DetectValidData((int *)(cpu_addr),iWidth,iHeight);
                         if(!ret){
                             hd->bHideUi = true;
                             ALOGD_IF(log_level(DBG_VERBOSE), "@video UI close,iWidth=%d,iHeight=%d",iWidth,iHeight);
                         }
+#if 1
                         gralloc->unlock(gralloc, second_layer->handle);
+#endif
                     }
 
                     if(hd->bHideUi)
