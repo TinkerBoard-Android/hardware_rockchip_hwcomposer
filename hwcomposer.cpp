@@ -30,6 +30,7 @@
 #include <map>
 #include <vector>
 #include <sstream>
+#include <stdio.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -67,6 +68,7 @@ static int update_display_bestmode(hwc_drm_display_t *hd, int display, DrmConnec
 #if SKIP_BOOT
 static unsigned int g_boot_cnt = 0;
 #endif
+static unsigned int g_boot_gles_cnt = 0;
 //#if RK_INVALID_REFRESH
 hwc_context_t* g_ctx = NULL;
 //#endif
@@ -153,26 +155,40 @@ class DrmHotplugHandler : public DrmEventHandler {
     DrmConnector *primary = NULL;
 
     for (auto &conn : drm_->connectors()) {
-      drmModeConnection old_state = conn->state();
+      //In sleep mode,we need get raw connector state,otherwise,we will miss the chance
+      //to handle hotplug event.
+      //Pg: sleep (force_disconnect will be true)==> plug out HDMI ==> plug in HDMI ==> wake up (force_disconnect still be ture)
+      //Workround: use raw connector state.
+      drmModeConnection old_state = conn->raw_state();
 
       conn->UpdateModes();
 
-      drmModeConnection cur_state = conn->state();
+      drmModeConnection cur_state = conn->raw_state();
 
       if (cur_state == old_state)
         continue;
-      ALOGI("%s event @%" PRIu64 " for connector %u\n",
+      ALOGI("hwc_hotplug: %s event @%" PRIu64 " for connector %u type=%s\n",
             cur_state == DRM_MODE_CONNECTED ? "Plug" : "Unplug", timestamp_us,
-            conn->id());
-
+            conn->id(),drm_->connector_type_str(conn->get_type()));
       if (cur_state == DRM_MODE_CONNECTED) {
-        if (conn->possible_displays() & HWC_DISPLAY_EXTERNAL_BIT)
-          extend = conn.get();
-        else if (conn->possible_displays() & HWC_DISPLAY_PRIMARY_BIT)
-          primary = conn.get();
+        /*
+         * if connector is only one , only to use primary. by libin
+         */
+        if (drm_->connectors().size() == 1){
+            primary = conn.get();
+            ALOGI("connectors_.size()=%u only primary\n",(uint32_t)drm_->connectors().size());
+        }else{
+            if (conn->possible_displays() & HWC_DISPLAY_EXTERNAL_BIT){
+              ALOGD("hwc_hotplug: find the first connect external type=%s",drm_->connector_type_str(conn->get_type()));
+              extend = conn.get();
+            }
+            else if (conn->possible_displays() & HWC_DISPLAY_PRIMARY_BIT){
+              ALOGD("hwc_hotplug: find the first connect primary type=%s",drm_->connector_type_str(conn->get_type()));
+              primary = conn.get();
+            }
+        }
       }
     }
-
     /*
      * status changed?
      */
@@ -180,13 +196,14 @@ class DrmHotplugHandler : public DrmEventHandler {
 
     DrmConnector *old_primary = drm_->GetConnectorFromType(HWC_DISPLAY_PRIMARY);
     primary = primary ? primary : old_primary;
-    if (!primary || primary->state() != DRM_MODE_CONNECTED) {
+    if (!primary || primary->raw_state() != DRM_MODE_CONNECTED) {
       primary = NULL;
       for (auto &conn : drm_->connectors()) {
         if (!(conn->possible_displays() & HWC_DISPLAY_PRIMARY_BIT))
           continue;
-        if (conn->state() == DRM_MODE_CONNECTED) {
+        if (conn->raw_state() == DRM_MODE_CONNECTED) {
           primary = conn.get();
+          ALOGD("hwc_hotplug: find the second connect primary type=%s",drm_->connector_type_str(conn->get_type()));
           break;
         }
       }
@@ -196,12 +213,13 @@ class DrmHotplugHandler : public DrmEventHandler {
       for (auto &conn : drm_->connectors()) {
         if (!(conn->possible_displays() & HWC_DISPLAY_PRIMARY_BIT))
           continue;
+        ALOGD("hwc_hotplug: find the third primary type=%s",drm_->connector_type_str(conn->get_type()));
         primary = conn.get();
       }
     }
 
     if (!primary) {
-      ALOGE("%s %d Failed to find primary display\n", __FUNCTION__, __LINE__);
+      ALOGE("hwc_hotplug: %s %d Failed to find primary display\n", __FUNCTION__, __LINE__);
       return;
     }
     if (primary != old_primary) {
@@ -215,6 +233,8 @@ class DrmHotplugHandler : public DrmEventHandler {
       hd->rel_xres = mode.h_display();
       hd->rel_yres = mode.v_display();
       hd->v_total = mode.v_total();
+      //rk: Avoid fb handle is null which lead HDMI display nothing with GLES.
+      usleep(HOTPLUG_MSLEEP*1000);
       procs_->invalidate(procs_);
 
       drm_->SetPrimaryDisplay(primary);
@@ -222,22 +242,32 @@ class DrmHotplugHandler : public DrmEventHandler {
 
     DrmConnector *old_extend = drm_->GetConnectorFromType(HWC_DISPLAY_EXTERNAL);
     extend = extend ? extend : old_extend;
-    if (!extend || extend->state() != DRM_MODE_CONNECTED) {
+    if (!extend || extend->raw_state() != DRM_MODE_CONNECTED) {
       extend = NULL;
       for (auto &conn : drm_->connectors()) {
         if (!(conn->possible_displays() & HWC_DISPLAY_EXTERNAL_BIT))
           continue;
         if (conn->id() == primary->id())
           continue;
-        if (conn->state() == DRM_MODE_CONNECTED) {
+        if (conn->raw_state() == DRM_MODE_CONNECTED) {
           extend = conn.get();
+          ALOGD("hwc_hotplug: find the second connect external type=%s",drm_->connector_type_str(conn->get_type()));
           break;
         }
       }
     }
     drm_->SetExtendDisplay(extend);
+    //When wake up from TV mode, it will bind crtc to TV connector.
+    //If we also plug in HDMI,and don't bind crtc to HDMI connector,
+    //the crtc of connected HDMI will be NULL. Which lead HDMI show nothing.
+    //Pg: Defect #149666
+    drm_->DisplayChanged();
+    drm_->UpdateDisplayRoute();
+    drm_->ClearDisplay();
     if (!extend) {
       procs_->hotplug(procs_, HWC_DISPLAY_EXTERNAL, 0);
+      //rk: Avoid fb handle is null which lead HDMI display nothing with GLES.
+      usleep(HOTPLUG_MSLEEP*1000);
       procs_->invalidate(procs_);
       return;
     }
@@ -344,13 +374,37 @@ static int update_display_bestmode(hwc_drm_display_t *hd, int display, DrmConnec
   if (display == HWC_DISPLAY_PRIMARY)
   {
     /* if resolution is null,set to "Auto" */
-    property_get("persist.sys.resolution.main", resolution, "Auto");
+    property_get("persist.sys.resolution.main", resolution, "default");
     property_get("sys.3d_resolution.main", resolution_3d, "0x0p0-0:0");
+
+    /*
+     * if unset resolution ,get it from baseparameter ,by libin
+     */
+    if(!(strcmp(resolution,"default")))
+    {
+        int res = 0;
+        res = hwc_get_baseparameter_config(resolution,display,BP_RESOLUTION);
+        if(res){
+            ALOGE("get native config fail, res = %d",res);
+        }
+    }
   }
   else
   {
-    property_get("persist.sys.resolution.aux", resolution, "Auto");
+    property_get("persist.sys.resolution.aux", resolution, "default");
     property_get("sys.3d_resolution.aux", resolution_3d, "0x0p0-0:0");
+
+    /*
+     * if unset resolution ,get it from baseparameter ,by libin
+     */
+    if(!(strcmp(resolution,"default")))
+    {
+        int res = 0;
+        res = hwc_get_baseparameter_config(resolution,display,BP_RESOLUTION);
+        if(res){
+            ALOGE("get native config fail, res = %d",res);
+        }
+    }
   }
 
   if(hd->is_3d && strcmp(resolution_3d,"0x0p0-0:0"))
@@ -365,7 +419,8 @@ static int update_display_bestmode(hwc_drm_display_t *hd, int display, DrmConnec
       interlaced_3d = false;
 
     if (width_3d != 0 && height_3d != 0) {
-      for (const DrmMode &conn_mode : c->modes()) {
+      //use raw mode,otherwise it may filter by resolution_white.xml
+      for (const DrmMode &conn_mode : c->raw_modes()) {
         if (conn_mode.equal(width_3d, height_3d, vrefresh_3d,  flag_3d, clk_3d, interlaced_3d)) {
           ALOGD_IF(log_level(DBG_DEBUG), "Match 3D parameters: w=%d,h=%d,val=%c,vrefresh_3d=%d,flag=%d,clk=%d",
                 width_3d,height_3d,val_3d,vrefresh_3d,flag_3d,clk_3d);
@@ -706,19 +761,6 @@ int DrmHwcLayer::InitFromHwcLayer(struct hwc_context_t *ctx, int display, hwc_la
     }
     mode = c->active_mode();
 
-
-   if((sf_layer->transform == HWC_TRANSFORM_ROT_90)
-       ||(sf_layer->transform == HWC_TRANSFORM_ROT_270)){
-	    h_scale_mul = (float) (source_crop.bottom - source_crop.top)
-                        / (display_frame.right - display_frame.left);
-	    v_scale_mul = (float) (source_crop.right - source_crop.left)
-	                    / (display_frame.bottom - display_frame.top);
-    } else {
-        h_scale_mul = (float) (source_crop.right - source_crop.left)
-	                    / (display_frame.right - display_frame.left);
-        v_scale_mul = (float) (source_crop.bottom - source_crop.top)
-	                    / (display_frame.bottom - display_frame.top);
-    }
     if(sf_handle)
     {
 #if RK_DRM_GRALLOC
@@ -737,6 +779,7 @@ int DrmHwcLayer::InitFromHwcLayer(struct hwc_context_t *ctx, int display, hwc_la
     {
         format = HAL_PIXEL_FORMAT_RGBA_8888;
     }
+
     if(format == HAL_PIXEL_FORMAT_YCrCb_NV12 || format == HAL_PIXEL_FORMAT_YCrCb_NV12_10)
         is_yuv = true;
     else
@@ -751,8 +794,11 @@ int DrmHwcLayer::InitFromHwcLayer(struct hwc_context_t *ctx, int display, hwc_la
             colorspace = V4L2_COLORSPACE_DEFAULT;
         }
 
-        if((android_colorspace & HAL_DATASPACE_TRANSFER_ST2084) == HAL_DATASPACE_TRANSFER_ST2084)
+        if((android_colorspace & HAL_DATASPACE_TRANSFER_MASK) == HAL_DATASPACE_TRANSFER_ST2084)
+        {
+            ALOGD_IF(log_level(DBG_VERBOSE),"%s:line=%d has st2084",__FUNCTION__,__LINE__);
             eotf = SMPTE_ST2084;
+        }
         else
         {
             //ALOGE("Unknow etof %d",eotf);
@@ -761,9 +807,45 @@ int DrmHwcLayer::InitFromHwcLayer(struct hwc_context_t *ctx, int display, hwc_la
     }
     else
     {
-        colorspace = V4L2_COLORSPACE_DEFAULT;
-        eotf = TRADITIONAL_GAMMA_SDR;
+        //If enter GLES in HDR video,fake the fb target layer to HDR.
+        if(hd->isHdr && bFbTarget_)
+        {
+            colorspace = V4L2_COLORSPACE_BT2020;
+            eotf = SMPTE_ST2084;
+        }
+        else
+        {
+            colorspace = V4L2_COLORSPACE_DEFAULT;
+            eotf = TRADITIONAL_GAMMA_SDR;
+        }
     }
+
+#if RK_BOX
+    if(is_yuv){
+      char value_yuv[PROPERTY_VALUE_MAX];
+      int scaleMode = 0;
+      property_get("persist.sys.video.cvrs",value_yuv, "0");
+      scaleMode = atoi(value_yuv);
+      if(scaleMode > 0){
+          ret = hwc_video_to_area(source_crop,display_frame,scaleMode);
+          if(ret == false)
+          ALOGE("hwc video to area fail !! reset to full screen");
+      }
+    }
+#endif
+
+    if((sf_layer->transform == HWC_TRANSFORM_ROT_90)
+        ||(sf_layer->transform == HWC_TRANSFORM_ROT_270)){
+         h_scale_mul = (float) (source_crop.bottom - source_crop.top)
+                         / (display_frame.right - display_frame.left);
+         v_scale_mul = (float) (source_crop.right - source_crop.left)
+                         / (display_frame.bottom - display_frame.top);
+     } else {
+         h_scale_mul = (float) (source_crop.right - source_crop.left)
+                         / (display_frame.right - display_frame.left);
+         v_scale_mul = (float) (source_crop.bottom - source_crop.top)
+                         / (display_frame.bottom - display_frame.top);
+     }
 
 #if RK_VIDEO_SKIP_LINE
     if(format == HAL_PIXEL_FORMAT_YCrCb_NV12 || format == HAL_PIXEL_FORMAT_YCrCb_NV12_10)
@@ -888,6 +970,8 @@ int DrmHwcLayer::InitFromHwcLayer(struct hwc_context_t *ctx, int display, hwc_la
             if(iFbdcSupport > 0)
                 is_afbc = true;
         }
+        else if(iFbdcSupport > 0)
+            is_afbc = true;
     }
 #endif
 
@@ -969,6 +1053,13 @@ static bool is_use_gles_comp(struct hwc_context_t *ctx, DrmConnector *connector,
         return true;
     }
 
+    if(g_boot_gles_cnt < BOOT_GLES_COUNT)
+    {
+        ALOGD_IF(log_level(DBG_DEBUG),"g_boot_gles_cnt=%d,go to GPU GLES at line=%d", g_boot_gles_cnt, __LINE__);
+        g_boot_gles_cnt++;
+        return true;
+    }
+
 #if RK_INVALID_REFRESH
     if(ctx->mOneWinOpt)
     {
@@ -1004,19 +1095,31 @@ static bool is_use_gles_comp(struct hwc_context_t *ctx, DrmConnector *connector,
         src_w = (int)(layer->sourceCropf.right - layer->sourceCropf.left);
         src_h = (int)(layer->sourceCropf.bottom - layer->sourceCropf.top);
 
-        if(src_w <= 0 || src_h <= 0)
+	if((layer->transform == HWC_TRANSFORM_ROT_90) || (layer->transform == HWC_TRANSFORM_ROT_270))
+	{
+		src_h = ALIGN_DOWN(src_h, 8);
+		src_w = ALIGN_DOWN(src_w, 2);
+	}
+	else
+	{
+		src_w = ALIGN_DOWN(src_w, 8);
+		src_h = ALIGN_DOWN(src_h, 2);
+	}
+
+        if(hd->isVideo && (layer->transform != 0)  && (src_w <= 0 || src_h <= 0))
         {
             ALOGD_IF(log_level(DBG_DEBUG),"layer src sourceCropf(%f,%f,%f,%f) is invalid,go to GPU GLES at line=%d",
                     layer->sourceCropf.left,layer->sourceCropf.top,layer->sourceCropf.right,layer->sourceCropf.bottom, __LINE__);
             return true;
         }
 
+#if 0
         if (layer->flags & HWC_SKIP_LAYER)
         {
             ALOGD_IF(log_level(DBG_DEBUG),"layer is skipped,go to GPU GLES at line=%d", __LINE__);
             return true;
         }
-
+#endif
         if(
 #if RK_RGA
             !ctx->drm.isSupportRkRga() && layer->transform
@@ -1068,7 +1171,7 @@ static bool is_use_gles_comp(struct hwc_context_t *ctx, DrmConnector *connector,
 
             if(hd->isHdr)
             {
-                if(connector && !ctx->drm.is_hdmi_support_hdr(connector)
+                if(connector && !connector->is_hdmi_support_hdr()
                     && crtc && !ctx->drm.is_plane_support_hdr2sdr(crtc))
                 {
                     ALOGD_IF(log_level(DBG_DEBUG), "layer is hdr video,go to GPU GLES at line=%d", __LINE__);
@@ -1076,7 +1179,7 @@ static bool is_use_gles_comp(struct hwc_context_t *ctx, DrmConnector *connector,
                 }
             }
 #if 1
-            if(!strstr(layername,"Sprite"))
+            if(format == HAL_PIXEL_FORMAT_YCrCb_NV12 || format == HAL_PIXEL_FORMAT_YCrCb_NV12_10)
             {
                 int src_xoffset = layer->sourceCropf.left * getPixelWidthByAndroidFormat(format);
                 if(!IS_ALIGN(src_xoffset,16))
@@ -1104,7 +1207,7 @@ static bool is_use_gles_comp(struct hwc_context_t *ctx, DrmConnector *connector,
 #endif
                 if(format == HAL_PIXEL_FORMAT_YCrCb_NV12 || format == HAL_PIXEL_FORMAT_YCrCb_NV12_10)
                     transform_nv12++;
-                else
+                else if(layer->compositionType != HWC_NODRAW)
                     transform_normal++;
             }
 
@@ -1234,15 +1337,20 @@ static bool update_hdmi_output_format(struct hwc_context_t *ctx, DrmConnector *c
     if (display == HWC_DISPLAY_PRIMARY)
     {
     /* if resolution is null,set to "Auto" */
-        property_get("persist.sys.color.main", prop_format, "Auto");
+        property_get("persist.sys.color.main", prop_format, "default");
     }
     else
     {
-        property_get("persist.sys.color.aux", prop_format, "Auto");
+        property_get("persist.sys.color.aux", prop_format, "default");
     }
     ret = parse_hdmi_output_format_prop(prop_format, &color_format, &color_depth);
     if (ret == false) {
-        return false;
+        hwc_get_baseparameter_config(prop_format,display,BP_COLOR);
+        ret = sscanf(prop_format,"%d-%d",&color_format,&color_depth);
+        if(ret != 2){
+            ALOGE("BP: get color fail!");
+            return false;
+        }
     }
 
     if(hd->color_format != color_format) {
@@ -1402,6 +1510,9 @@ static int hwc_prepare(hwc_composer_device_1_t *dev, size_t num_displays,
   int ret = -1;
   static HDMI_STAT last_hdmi_status = HDMI_ON;
   char acStatus[10];
+#ifdef RK3368_PX5CAR
+  int win1_reserved = hwc_get_int_property("sys.hwc.win1.reserved", "0");
+#endif
 
     init_log_level();
     hwc_dump_fps();
@@ -1455,9 +1566,27 @@ static int hwc_prepare(hwc_composer_device_1_t *dev, size_t num_displays,
     hwc_drm_display_t *hd = &ctx->displays[connector->display()];
     DrmCrtc *crtc = ctx->drm.GetCrtcFromConnector(connector);
     if (connector->state() != DRM_MODE_CONNECTED || !crtc) {
+      ALOGD_IF(log_level(DBG_DEBUG),"%s: connector[%d] is disconnect type=%s",__FUNCTION__,
+                connector->display(),ctx->drm.connector_type_str(connector->get_type()));
       hwc_list_nodraw(display_contents[i]);
       continue;
     }
+
+#if 1
+    hd->stereo_mode = NON_3D;
+    int bk_is_3d = hd->is_3d;
+    hd->is_3d = detect_3d_mode(hd, display_contents[i], i);
+    if(bk_is_3d != hd->is_3d)
+    {
+        int timeline = 0;
+        char acTimelie[10];
+        timeline = property_get_int32("sys.display.timeline", -1);
+        timeline++;
+        snprintf(acTimelie,10,"%d",timeline);
+        property_set("sys.display.timeline", acTimelie);
+    }
+#endif
+
 	update_hdmi_output_format(ctx, connector, i, hd);
     update_display_bestmode(hd, i, connector);
     DrmMode mode = connector->best_mode();
@@ -1475,6 +1604,24 @@ static int hwc_prepare(hwc_composer_device_1_t *dev, size_t num_displays,
     for (std::vector<PlaneGroup *> ::const_iterator iter = plane_groups.begin();
         iter != plane_groups.end(); ++iter)
     {
+#ifdef RK3368_PX5CAR
+        if (win1_reserved > 0 &&
+            ((*iter)->planes.at(0)->type() == DRM_PLANE_TYPE_OVERLAY) &&
+            (*iter)->planes.at(0)->get_yuv())
+        {
+            (*iter)->b_reserved = true;
+            for(std::vector<DrmPlane*> ::const_iterator iter_plane = (*iter)->planes.begin();
+               iter_plane != (*iter)->planes.end(); ++iter_plane)
+            {
+                (*iter_plane)->set_reserved(true);
+            }
+            static bool reserved_win_debug = true;
+            if (reserved_win_debug)
+                ALOGE("reserved plane share_id = %d", (*iter)->share_id);
+            reserved_win_debug = false;
+            continue;
+        }
+#endif
         if(hd->is_interlaced && (*iter)->planes.size() > 2)
         {
             (*iter)->b_reserved = true;
@@ -1545,14 +1692,20 @@ static int hwc_prepare(hwc_composer_device_1_t *dev, size_t num_displays,
                 if(usage & HDRUSAGE)
                 {
                     isHdr = true;
-                    if(hd->isHdr != isHdr && ctx->drm.is_hdmi_support_hdr(connector))
+                    //vop limit: hdr video must in the bottom.
+                    if(j != 0)
+                    {
+                        ALOGD_IF(log_level(DBG_DEBUG),"hdr video must in the bottom of layer list,go to GPU GLES at line=%d", __LINE__);
+                        use_framebuffer_target = true;
+                    }
+                    if(hd->isHdr != isHdr && connector->is_hdmi_support_hdr())
                     {
                         uint32_t android_colorspace = hwc_get_layer_colorspace(layer);
                         struct hdr_static_metadata hdr_metadata;
-
                         memset(&hdr_metadata, 0, sizeof(hdr_metadata));
-                        if((android_colorspace & HAL_DATASPACE_TRANSFER_ST2084) == HAL_DATASPACE_TRANSFER_ST2084)
+                        if((android_colorspace & HAL_DATASPACE_TRANSFER_MASK) == HAL_DATASPACE_TRANSFER_ST2084)
                         {
+                            ALOGD_IF(log_level(DBG_VERBOSE),"%s:line=%d has st2084",__FUNCTION__,__LINE__);
                             hdr_metadata.eotf = SMPTE_ST2084;
                         }
                         else
@@ -1606,12 +1759,13 @@ static int hwc_prepare(hwc_composer_device_1_t *dev, size_t num_displays,
             }
          }
     }
-
+#if RK_INVALID_REFRESH
     if(ctx->mOneWinOpt && force_not_invalid_refresh && hd->rel_xres >= 3840 && hd->rel_xres != hd->framebuffer_width)
     {
        ALOGD_IF(log_level(DBG_DEBUG),"disable static timer");
        ctx->mOneWinOpt = false;
     }
+#endif
 
     //Switch hdr mode
     if(hd->isHdr != isHdr)
@@ -1632,7 +1786,7 @@ static int hwc_prepare(hwc_composer_device_1_t *dev, size_t num_displays,
         }
 #endif
 
-        if(!hd->isHdr && ctx->drm.is_hdmi_support_hdr(connector))
+        if(!hd->isHdr && connector->is_hdmi_support_hdr())
         {
             uint32_t android_colorspace = 0;
             struct hdr_static_metadata hdr_metadata;
@@ -1642,11 +1796,6 @@ static int hwc_prepare(hwc_composer_device_1_t *dev, size_t num_displays,
             set_hdmi_hdr_meta(ctx, connector, &hdr_metadata, hd, android_colorspace);
         }
     }
-
-#if 1
-    hd->stereo_mode = NON_3D;
-    hd->is_3d = detect_3d_mode(hd, display_contents[i], i);
-#endif
 
     int iLastFps = num_layers-1;
     if(hd->stereo_mode == FPS_3D)
@@ -1679,18 +1828,18 @@ static int hwc_prepare(hwc_composer_device_1_t *dev, size_t num_displays,
         }
     }
 
-    if(!use_framebuffer_target)
-        use_framebuffer_target = is_use_gles_comp(ctx, connector, display_contents[i], connector->display());
-
 #if RK_VIDEO_UI_OPT
     video_ui_optimize(ctx->gralloc, display_contents[i], &ctx->displays[connector->display()]);
 #endif
+
+    if(!use_framebuffer_target)
+        use_framebuffer_target = is_use_gles_comp(ctx, connector, display_contents[i], connector->display());
 
     bool bHasFPS_3D_UI = false;
     int index = 0;
     for (int j = 0; j < num_layers; j++) {
       hwc_layer_1_t *sf_layer = &display_contents[i]->hwLayers[j];
-      if(sf_layer->compositionType != HWC_FRAMEBUFFER_TARGET && sf_layer->handle == NULL)
+      if(!(sf_layer->flags & HWC_SKIP_LAYER) && sf_layer->compositionType != HWC_FRAMEBUFFER_TARGET && sf_layer->handle == NULL)
         continue;
       if(sf_layer->compositionType == HWC_NODRAW)
         continue;
@@ -1919,7 +2068,6 @@ static int hwc_set(hwc_composer_device_1_t *dev, size_t num_displays,
   struct hwc_context_t *ctx = (struct hwc_context_t *)&dev->common;
   int ret = 0;
 
- ALOGD_IF(log_level(DBG_VERBOSE),"----------------------------frame=%d end----------------------------",get_frame());
  inc_frame();
 
   std::vector<CheckedOutputFd> checked_output_fences;
@@ -1927,6 +2075,7 @@ static int hwc_set(hwc_composer_device_1_t *dev, size_t num_displays,
   std::vector<DrmCompositionDisplayLayersMap> layers_map;
   std::vector<std::vector<size_t>> layers_indices;
   std::vector<uint32_t> fail_displays;
+  std::unique_ptr<DrmComposition> composition;
 
   // layers_map.reserve(num_displays);
   layers_indices.reserve(num_displays);
@@ -1958,6 +2107,10 @@ static int hwc_set(hwc_composer_device_1_t *dev, size_t num_displays,
 
     DrmConnector *c = ctx->drm.GetConnectorFromType(i);
     if (!c || c->state() != DRM_MODE_CONNECTED) {
+
+    if(c)
+      ALOGD_IF(log_level(DBG_DEBUG),"hwc_set connector is disconnect,type=%s",ctx->drm.connector_type_str(c->get_type()));
+
       hwc_sync_release(sf_display_contents[i]);
       continue;
     }
@@ -2123,8 +2276,8 @@ static int hwc_set(hwc_composer_device_1_t *dev, size_t num_displays,
       }
       if(!layer.sf_handle)
       {
-        ALOGE("sf_handle is null,maybe fb target is null");
-        return -EINVAL;
+        ALOGE("%s: sf_handle is null,maybe fb target is null",__FUNCTION__);
+        goto err;
       }
       if(!layer.bClone_)
         layer.ImportBuffer(ctx, layer.raw_sf_layer, ctx->importer.get());
@@ -2135,16 +2288,16 @@ static int hwc_set(hwc_composer_device_1_t *dev, size_t num_displays,
   ctx->drm.UpdateDisplayRoute();
   ctx->drm.UpdatePropertys();
   ctx->drm.ClearDisplay();
-  std::unique_ptr<DrmComposition> composition(
-      ctx->drm.compositor()->CreateComposition(ctx->importer.get()));
+  composition = ctx->drm.compositor()->CreateComposition(ctx->importer.get());
   if (!composition) {
-    ALOGE("Drm composition init failed");
-    return -EINVAL;
+    ALOGE("%s: Drm composition init failed",__FUNCTION__);
+    goto err;
   }
 
   ret = composition->SetLayers(layers_map.size(), layers_map.data());
   if (ret) {
-    return -EINVAL;
+    ALOGD("%s: SetLayers fail",__FUNCTION__);
+    goto err;
   }
 
   for (size_t i = 0; i < num_displays; ++i) {
@@ -2164,7 +2317,8 @@ static int hwc_set(hwc_composer_device_1_t *dev, size_t num_displays,
       {
           ret = composition->SetCompPlanes(ctx->comp_plane_group[i].display, ctx->comp_plane_group[i].composition_planes);
           if (ret) {
-            return -EINVAL;
+            ALOGE("%s: SetCompPlanes fail",__FUNCTION__);
+            goto err;
           }
       }
       else
@@ -2176,7 +2330,8 @@ static int hwc_set(hwc_composer_device_1_t *dev, size_t num_displays,
 
   ret = ctx->drm.compositor()->QueueComposition(std::move(composition));
   if (ret) {
-    return -EINVAL;
+    ALOGE("%s: QueueComposition fail",__FUNCTION__);
+    goto err;
   }
 
   for (size_t i = 0; i < num_displays; ++i) {
@@ -2217,8 +2372,21 @@ static int hwc_set(hwc_composer_device_1_t *dev, size_t num_displays,
 #if RK_INVALID_REFRESH
   hwc_static_screen_opt_set(ctx->isGLESComp);
 #endif
+  ALOGD_IF(log_level(DBG_VERBOSE),"----------------------------frame=%d end----------------------------",get_frame());
 
   return ret;
+
+err:
+    ALOGE("%s: not normal frame happen",__FUNCTION__);
+    for (size_t i = 0; i < num_displays; ++i) {
+        hwc_display_contents_1_t *dc = sf_display_contents[i];
+        if (!dc)
+          continue;
+
+        hwc_sync_release(dc);
+    }
+
+    return -EINVAL;
 }
 
 static int hwc_event_control(struct hwc_composer_device_1 *dev, int display,
@@ -2281,6 +2449,21 @@ static int hwc_set_power_mode(struct hwc_composer_device_1 *dev, int display,
   if (!connector) {
     ALOGE("Failed to get connector for display %d line=%d", display,__LINE__);
     return -ENODEV;
+  }
+
+  //In tv mode, we still need update the hdmi force_disconnect.
+  //Pg: sleep(force_disconnect will be true) ==> plug out HDMI(switch to tv mode) ==> wake up ==> plug in HDMI(force_disconnect still be true)
+  //Workround:                                                                            ==> update HDMI's force_disconnect
+  if(connector->get_type() == DRM_MODE_CONNECTOR_TV)
+  {
+    for (auto &conn : ctx->drm.connectors())
+    {
+        if(conn->get_type() == DRM_MODE_CONNECTOR_HDMIA)
+        {
+            conn->force_disconnect(dpmsValue == DRM_MODE_DPMS_OFF);
+            break;
+        }
+    }
   }
 
   connector->force_disconnect(dpmsValue == DRM_MODE_DPMS_OFF);
@@ -2354,8 +2537,19 @@ static int hwc_get_display_configs(struct hwc_composer_device_1 *dev,
   connector->set_current_mode(mode);
 
   char framebuffer_size[PROPERTY_VALUE_MAX];
-  uint32_t width, height, vrefresh;
-  property_get("persist.sys.framebuffer.main", framebuffer_size, "0x0@60");
+  uint32_t width = 0, height = 0 , vrefresh = 0 ;
+  property_get("persist.sys.framebuffer.main", framebuffer_size, "default");
+
+  /*
+   * if unset framebuffer_size, get it from baseparameter , by libin
+   */
+  if(!strcmp(framebuffer_size,"default")){
+    int res = 0;
+    res = hwc_get_baseparameter_config(framebuffer_size,display,BP_FB_SIZE);
+    if(res)
+        ALOGW("BP: hwc get baseparameter config err ,res = %d",res);
+  }
+
   sscanf(framebuffer_size, "%dx%d@%d", &width, &height, &vrefresh);
   if (width && height) {
     hd->framebuffer_width = width;
@@ -2552,6 +2746,8 @@ static int hwc_initialize_display(struct hwc_context_t *ctx, int display) {
     hd->isHdr = false;
     memset(&hd->last_hdr_metadata, 0, sizeof(hd->last_hdr_metadata));
     hd->colorimetry = 0;
+    hd->hotplug_timeline = 0;
+    hd->display_timeline = 0;
 
   return 0;
 }
@@ -2681,6 +2877,7 @@ static int hwc_device_open(const struct hw_module_t *module, const char *name,
   }
 
   init_rk_debug();
+  hwc_get_baseparameter_config(NULL,0,BP_UPDATE);
 
   std::unique_ptr<hwc_context_t> ctx(new hwc_context_t());
   if (!ctx) {

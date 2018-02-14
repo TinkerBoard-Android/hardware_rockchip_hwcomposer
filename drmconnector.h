@@ -53,6 +53,10 @@ class DrmConnector {
   const std::vector<DrmMode> &modes() const {
     return modes_;
   }
+  const std::vector<DrmMode> &raw_modes() const {
+    return raw_modes_;
+  }
+
   const DrmMode &best_mode() const;
   const DrmMode &active_mode() const;
   const DrmMode &current_mode() const;
@@ -79,10 +83,14 @@ class DrmConnector {
   void set_encoder(DrmEncoder *encoder);
 
   drmModeConnection state() const;
+  drmModeConnection raw_state() const;
   void force_disconnect(bool force);
 
   uint32_t get_type() { return type_; }
   int possible_displays() { return possible_displays_; }
+
+  bool isSupportSt2084() { return bSupportSt2084_; }
+  bool is_hdmi_support_hdr() const;
 
   uint32_t mm_width() const;
   uint32_t mm_height() const;
@@ -109,6 +117,7 @@ class DrmConnector {
   DrmMode current_mode_;
   DrmMode best_mode_;
   std::vector<DrmMode> modes_;
+  std::vector<DrmMode> raw_modes_;
 
   DrmProperty dpms_property_;
   DrmProperty crtc_id_property_;
@@ -124,6 +133,8 @@ class DrmConnector {
 
   std::vector<DrmEncoder *> possible_encoders_;
   uint32_t possible_displays_;
+
+  bool bSupportSt2084_;
 
   drmModeConnectorPtr connector_;
 };

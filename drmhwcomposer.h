@@ -28,7 +28,7 @@
 #include "hwc_debug.h"
 
 /*hwc version*/
-#define GHWC_VERSION                    "0.34"
+#define GHWC_VERSION                    "0.40"
 
 /* hdr usage */
 #define HDRUSAGE                                       0x3000000
@@ -69,6 +69,8 @@ namespace android {
 #if SKIP_BOOT
 #define BOOT_COUNT       (2)
 #endif
+
+#define BOOT_GLES_COUNT  (5)
 
 typedef enum tagMode3D
 {

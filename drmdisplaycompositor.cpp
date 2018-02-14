@@ -614,7 +614,8 @@ DrmRgaBuffer &rgaBuffer, DrmDisplayComposition *display_comp, DrmHwcLayer &layer
     }
     dst_w = dst_r - dst_l;
     dst_h = dst_b - dst_t;
-
+    int dst_raw_w = dst_w;
+    int dst_raw_h = dst_h;
     dst_w = ALIGN_DOWN(dst_w, 8);
     dst_h = ALIGN_DOWN(dst_h, 2);
 #else
@@ -859,10 +860,17 @@ int DrmDisplayCompositor::DisablePlanes(DrmDisplayComposition *display_comp) {
   }
 
   int ret;
+#ifdef RK3368_PX5CAR
+  int win1_reserved = hwc_get_int_property("sys.hwc.win1.reserved", "0");
+#endif
   std::vector<DrmCompositionPlane> &comp_planes =
       display_comp->composition_planes();
   for (DrmCompositionPlane &comp_plane : comp_planes) {
     DrmPlane *plane = comp_plane.plane();
+#ifdef RK3368_PX5CAR
+    if (win1_reserved > 0 && plane->is_reserved())
+        continue;
+#endif
     ret = drmModeAtomicAddProperty(pset, plane->id(),
                                    plane->crtc_property().id(), 0) < 0 ||
           drmModeAtomicAddProperty(pset, plane->id(), plane->fb_property().id(),
@@ -1080,10 +1088,15 @@ int DrmDisplayCompositor::CommitFrame(DrmDisplayComposition *display_comp,
     }
     else
     {
-        if (display_ == 0)
-          property_get("persist.sys.overscan.main", overscan, "overscan 100,100,100,100");
-        else
-          property_get("persist.sys.overscan.aux", overscan, "overscan 100,100,100,100");
+        if (display_ == 0){
+          property_get("persist.sys.overscan.main", overscan, "default");
+          if(!strcmp(overscan,"default"))
+            hwc_get_baseparameter_config(overscan,display_,BP_OVERSCAN);
+        }else{
+          property_get("persist.sys.overscan.aux", overscan, "default");
+          if(!strcmp(overscan,"default"))
+            hwc_get_baseparameter_config(overscan,display_,BP_OVERSCAN);
+        }
 
         sscanf(overscan, "overscan %d,%d,%d,%d", &left_margin, &top_margin,
                &right_margin, &bottom_margin);
@@ -1126,6 +1139,10 @@ int DrmDisplayCompositor::CommitFrame(DrmDisplayComposition *display_comp,
 
     //Find out the fb target for clone layer.
     int fb_target_fb_id = -1;
+#ifdef RK3368_PX5CAR
+    int win1_reserved = hwc_get_int_property("sys.hwc.win1.reserved", "0");
+#endif
+
     if(display_comp->mode_3d() == FPS_3D)
     {
         for (DrmCompositionPlane &comp_plane : comp_planes) {
@@ -1168,7 +1185,7 @@ int DrmDisplayCompositor::CommitFrame(DrmDisplayComposition *display_comp,
     uint64_t rotation = 0;
     uint64_t alpha = 0xFF;
     uint16_t eotf = TRADITIONAL_GAMMA_SDR;
-    uint32_t colorspace = V4L2_COLORSPACE_SRGB;
+    uint32_t colorspace = V4L2_COLORSPACE_DEFAULT;
 #if RK_RGA
     bool is_rotate_by_rga = false;
 #endif
@@ -1240,11 +1257,9 @@ int DrmDisplayCompositor::CommitFrame(DrmDisplayComposition *display_comp,
       if (layer.blending == DrmHwcBlending::kPreMult)
         alpha = layer.alpha;
 
-      if(is_yuv)
-      {
+
         eotf = layer.eotf;
         colorspace = layer.colorspace;
-      }
 
 #if RK_DEBUG_CHECK_CRC
     void* cpu_addr;
@@ -1282,6 +1297,10 @@ int DrmDisplayCompositor::CommitFrame(DrmDisplayComposition *display_comp,
     }
 
     // Disable the plane if there's no framebuffer
+#ifdef RK3368_PX5CAR
+    if (fb_id < 0 && win1_reserved > 0 && plane->is_reserved())
+        continue;
+#endif
     if (fb_id < 0) {
       ret = drmModeAtomicAddProperty(pset, plane->id(),
                                      plane->crtc_property().id(), 0) < 0 ||

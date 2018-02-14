@@ -92,7 +92,15 @@ int DrmConnector::Init() {
   if (ret) {
    ALOGW("Could not get hdmi_output_depth property\n");
   }
+
+  bSupportSt2084_ = drm_->is_hdr_panel_support_st2084(this);
+
   return 0;
+}
+
+bool DrmConnector::is_hdmi_support_hdr() const
+{
+    return hdr_metadata_property_.id() && bSupportSt2084_;
 }
 
 uint32_t DrmConnector::id() const {
@@ -139,10 +147,45 @@ int DrmConnector::UpdateModes() {
   std::vector<DrmMode> new_modes;
   for (int i = 0; i < c->count_modes; ++i) {
     bool exists = false;
-    bool verify = false;
     for (const DrmMode &mode : modes_) {
-      if (mode == c->modes[i] && drm_->mode_verify(mode)) {
-        new_modes.push_back(mode);
+      if (mode == c->modes[i]) {
+        if(type_ == DRM_MODE_CONNECTOR_HDMIA || type_ == DRM_MODE_CONNECTOR_DisplayPort)
+        {
+            //filter mode by /system/usr/share/resolution_white.xml.
+            if(drm_->mode_verify(mode))
+            {
+                new_modes.push_back(mode);
+                exists = true;
+                break;
+            }
+        }
+        else
+        {
+            new_modes.push_back(mode);
+            exists = true;
+            break;
+        }
+      }
+    }
+    if (exists)
+      continue;
+
+    DrmMode m(&c->modes[i]);
+    if ((type_ == DRM_MODE_CONNECTOR_HDMIA || type_ == DRM_MODE_CONNECTOR_DisplayPort) && !drm_->mode_verify(m))
+      continue;
+
+    m.set_id(drm_->next_mode_id());
+    new_modes.push_back(m);
+  }
+  modes_.swap(new_modes);
+
+  //Get original mode from connector
+  std::vector<DrmMode> new_raw_modes;
+  for (int i = 0; i < c->count_modes; ++i) {
+    bool exists = false;
+    for (const DrmMode &mode : modes_) {
+      if (mode == c->modes[i]) {
+        new_raw_modes.push_back(mode);
         exists = true;
         break;
       }
@@ -151,13 +194,11 @@ int DrmConnector::UpdateModes() {
       continue;
 
     DrmMode m(&c->modes[i]);
-    if (!drm_->mode_verify(m))
-      continue;
-
     m.set_id(drm_->next_mode_id());
-    new_modes.push_back(m);
+    new_raw_modes.push_back(m);
   }
-  modes_.swap(new_modes);
+  raw_modes_.swap(new_raw_modes);
+
   return 0;
 }
 
@@ -254,6 +295,10 @@ void DrmConnector::force_disconnect(bool force) {
 drmModeConnection DrmConnector::state() const {
   if (force_disconnect_)
     return DRM_MODE_DISCONNECTED;
+  return state_;
+}
+
+drmModeConnection DrmConnector::raw_state() const {
   return state_;
 }
 

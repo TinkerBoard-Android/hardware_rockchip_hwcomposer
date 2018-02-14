@@ -39,7 +39,6 @@ DrmProperty::DrmProperty(drmModePropertyPtr p, uint64_t value)
 
 void DrmProperty::Init(drmModePropertyPtr p, uint64_t value) {
   id_ = 0;
-  p_ = p;
   id_ = p->prop_id;
   flags_ = p->flags;
   name_ = p->name;
@@ -112,7 +111,7 @@ int DrmProperty::value(uint64_t *value) const {
             ALOGE("You don't set feature name for %s",name_.c_str());
             return -EINVAL;
         }
-        //if(!strcmp(feature_name_,"scale"))
+
         if(strlen(feature_name_) > 0)
         {
             for (auto &drm_enum : enums_)
@@ -126,7 +125,7 @@ int DrmProperty::value(uint64_t *value) const {
         }
         else
         {
-            *value = value_;
+            *value = 0xFF;
         }
 
         return 0;

@@ -40,6 +40,9 @@
 #include <sstream>
 #include <assert.h>
 
+#include "hwc_rockchip.h"
+
+
 //you can define it in external/libdrm/include/drm/drm.h
 #define DRM_CLIENT_CAP_SHARE_PLANES     4
 
@@ -97,6 +100,15 @@ void DrmResources::init_white_modes(void)
       continue; \
     } \
     m.x = atoi(_##x->GetText())
+  #define PARSE_HEX(x) \
+    tinyxml2::XMLElement* _##x = resolution->FirstChildElement(#x); \
+    if (!_##x) { \
+      ALOGE("------> failed to parse %s\n", #x); \
+      resolution = resolution->NextSiblingElement(); \
+      continue; \
+    } \
+    sscanf(_##x->GetText(), "%x", &m.x);
+
     PARSE(clock);
     PARSE(hdisplay);
     PARSE(hsync_start);
@@ -107,7 +119,9 @@ void DrmResources::init_white_modes(void)
     PARSE(vsync_end);
     PARSE(vscan);
     PARSE(vrefresh);
-    PARSE(flags);
+    PARSE(htotal);
+    PARSE(vtotal);
+    PARSE_HEX(flags);
 
     DrmMode mode(&m);
     /* add modes in "resolution.xml" to white list */
@@ -121,7 +135,9 @@ bool DrmResources::mode_verify(const DrmMode &m) {
     return true;
 
   for (const DrmMode &mode : white_modes_) {
-    if(mode.h_display() == m.h_display() && mode.v_display() == m.v_display())
+    if (mode.h_display() == m.h_display() && mode.v_display() == m.v_display() &&
+	mode.h_total() == m.h_total() && mode.v_total() == m.v_total() &&
+	mode.clock() == m.clock() && mode.flags() == m.flags())
       return true;
   }
   return false;
@@ -137,6 +153,30 @@ void DrmResources::ConfigurePossibleDisplays()
 
   primary_length = property_get("sys.hwc.device.primary", primary_name, NULL);
   extend_length = property_get("sys.hwc.device.extend", extend_name, NULL);
+
+  /*
+   * if unset primary_name or extend_name,get them from baseparameter,by libin
+   */
+  if(!primary_length){
+      int res = 0;
+      res = hwc_get_baseparameter_config(primary_name,0,BP_DEVICE);
+      if(res){
+          ALOGE("BP: hwc get baseparameter err");
+      }else{
+          primary_length = strlen(primary_name);
+          //ALOGD("LB:DEBUG primary_length = %d",primary_length);
+      }
+  }
+  if(!extend_length){
+      int res = 0;
+      res = hwc_get_baseparameter_config(extend_name,1,BP_DEVICE);
+      if(res){
+          ALOGE("BP: hwc get baseparameter err");
+      }else{
+          extend_length = strlen(extend_name);
+          //ALOGD("LB:DEBUG extend_length = %d",extend_length);
+      }
+  }
 
   if (!primary_length)
     default_display_possible |= HWC_DISPLAY_PRIMARY_BIT;
@@ -536,6 +576,9 @@ int DrmResources::Init() {
     return ret;
   }
 
+  prop_timeline_ = 0;
+  hotplug_timeline = 0;
+
   return 0;
 }
 
@@ -618,23 +661,23 @@ int DrmResources::UpdatePropertys(void)
 
   if (primary) {
     DRM_ATOMIC_ADD_PROP(primary->id(), primary->brightness_id_property().id(),
-                        property_get_int32("persist.sys.brightness.main", 50))
+                        hwc_get_baseparameter_config(NULL,HWC_DISPLAY_PRIMARY,BP_BRIGHTNESS))
     DRM_ATOMIC_ADD_PROP(primary->id(), primary->contrast_id_property().id(),
-                        property_get_int32("persist.sys.contrast.main", 50))
+                        hwc_get_baseparameter_config(NULL,HWC_DISPLAY_PRIMARY,BP_CONTRAST))
     DRM_ATOMIC_ADD_PROP(primary->id(), primary->saturation_id_property().id(),
-                        property_get_int32("persist.sys.saturation.main", 50))
+                        hwc_get_baseparameter_config(NULL,HWC_DISPLAY_PRIMARY,BP_SATURATION))
     DRM_ATOMIC_ADD_PROP(primary->id(), primary->hue_id_property().id(),
-                        property_get_int32("persist.sys.hue.main", 50))
+                        hwc_get_baseparameter_config(NULL,HWC_DISPLAY_PRIMARY,BP_HUE))
   }
   if (extend) {
     DRM_ATOMIC_ADD_PROP(extend->id(), extend->brightness_id_property().id(),
-                        property_get_int32("persist.sys.brightness.aux", 50))
+                        hwc_get_baseparameter_config(NULL,HWC_DISPLAY_EXTERNAL,BP_BRIGHTNESS))
     DRM_ATOMIC_ADD_PROP(extend->id(), extend->contrast_id_property().id(),
-                        property_get_int32("persist.sys.contrast.aux", 50))
+                        hwc_get_baseparameter_config(NULL,HWC_DISPLAY_EXTERNAL,BP_CONTRAST))
     DRM_ATOMIC_ADD_PROP(extend->id(), extend->saturation_id_property().id(),
-                        property_get_int32("persist.sys.saturation.aux", 50))
+                        hwc_get_baseparameter_config(NULL,HWC_DISPLAY_EXTERNAL,BP_SATURATION))
     DRM_ATOMIC_ADD_PROP(extend->id(), extend->hue_id_property().id(),
-                        property_get_int32("persist.sys.hue.aux", 50))
+                        hwc_get_baseparameter_config(NULL,HWC_DISPLAY_EXTERNAL,BP_HUE))
   }
 
   uint32_t flags = 0;
@@ -1141,32 +1184,54 @@ bool DrmResources::is_hdr_panel_support_st2084(DrmConnector *conn) const {
 	struct hdr_static_metadata* blob_data;
 	drmModePropertyBlobPtr blob;
 	bool bSupport = false;
-    drmModePropertyPtr hdr_panel_prop = conn->hdr_panel_property().get_raw_property();
+  drmModeObjectPropertiesPtr props;
 
-    if (drm_property_type_is(hdr_panel_prop, DRM_MODE_PROP_BLOB))
-    {
-        ALOGE("%s:line=%d,is not blob",__FUNCTION__,__LINE__);
+  props = drmModeObjectGetProperties(fd(), conn->id(), DRM_MODE_OBJECT_CONNECTOR);
+  if (!props) {
+    ALOGE("Failed to get properties for %d/%x", conn->id(), DRM_MODE_OBJECT_CONNECTOR);
+    return false;
+  }
+
+  bool found = false;
+  int value;
+  for (int i = 0; !found && (size_t)i < props->count_props; ++i) {
+    drmModePropertyPtr p = drmModeGetProperty(fd(), props->props[i]);
+    if (p && !strcmp(p->name, "HDR_PANEL_METADATA")) {
+
+      if (!drm_property_type_is(p, DRM_MODE_PROP_BLOB))
+      {
+          ALOGE("%s:line=%d,is not blob",__FUNCTION__,__LINE__);
+          drmModeFreeProperty(p);
+          drmModeFreeObjectProperties(props);
+          return false;
+      }
+
+      if (!p->count_blobs)
+        value = props->prop_values[i];
+      else
+        value = p->blob_ids[0];
+      blob = drmModeGetPropertyBlob(fd(), value);
+      if (!blob) {
+        ALOGE("%s:line=%d, blob is null",__FUNCTION__,__LINE__);
+        drmModeFreeProperty(p);
+        drmModeFreeObjectProperties(props);
         return false;
+      }
+
+      blob_data = (struct hdr_static_metadata*)blob->data;
+
+      bSupport = blob_data->eotf & (1 << SMPTE_ST2084);
+
+      drmModeFreePropertyBlob(blob);
+
+      found = true;
     }
+    drmModeFreeProperty(p);
+  }
 
-	blob = drmModeGetPropertyBlob(fd(), hdr_panel_prop->blob_ids[0]);
-	if (!blob) {
-		ALOGE("%s:line=%d, blob is null",__FUNCTION__,__LINE__);
-		return false;
-	}
+  drmModeFreeObjectProperties(props);
 
-	blob_data = (struct hdr_static_metadata*)blob->data;
-
-	bSupport = blob_data->eotf & (1 << SMPTE_ST2084);
-
-	drmModeFreePropertyBlob(blob);
-
-	return bSupport;
-}
-
-bool DrmResources::is_hdmi_support_hdr(DrmConnector *conn) const
-{
-    return conn->hdr_metadata_property().id() && is_hdr_panel_support_st2084(conn);
+  return bSupport;
 }
 
 bool DrmResources::is_plane_support_hdr2sdr(DrmCrtc *crtc) const
